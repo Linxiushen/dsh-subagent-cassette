@@ -70,7 +70,7 @@
     "test:coverage": "vitest run --coverage",
     "test:dist": "node tests/dist-smoke.mjs",
     "check": "pnpm lint && pnpm typecheck && pnpm test:coverage && pnpm build && pnpm test:dist && pnpm publint",
-    "publint": "publint",
+    "publint": "publint --pack=false",
     "prepack": "pnpm check"
   },
   "dependencies": {

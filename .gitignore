@@ -1,6 +1,7 @@
 node_modules/
 dist/
 coverage/
+.artifacts/
 .dsh-cassettes/
 *.cassette.jsonl
 *.writer.lock/
