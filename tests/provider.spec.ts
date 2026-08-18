@@ -21,7 +21,11 @@ afterEach(async () => {
   await Promise.all(workspaces.splice(0).map(workspace => workspace.cleanup()))
 })
 
-async function setupRecorder(options?: { redactSecrets?: boolean; requestStorage?: 'metadata' | 'full' }) {
+async function setupRecorder(options?: {
+  redactSecrets?: boolean
+  requestStorage?: 'metadata' | 'full'
+  redactionPatterns?: string[]
+}) {
   const temp = await tempWorkspace()
   workspaces.push(temp)
   const upstream = new QueueProvider()
@@ -32,11 +36,13 @@ async function setupRecorder(options?: { redactSecrets?: boolean; requestStorage
     inheritsParentContext: upstream.inheritsParentContext,
     requestStorage: options?.requestStorage ?? 'metadata',
     redactSecrets: options?.redactSecrets ?? false,
+    ...(options?.redactionPatterns === undefined ? {} : { redactionPatterns: options.redactionPatterns }),
   })
   const writer = await CassetteWriter.open(temp.path(), header, 'create')
   const recorder = new RecordingSubagentProvider('cassette', upstream, writer, {
     requestStorage: options?.requestStorage ?? 'metadata',
     redactSecrets: options?.redactSecrets ?? false,
+    ...(options?.redactionPatterns === undefined ? {} : { redactionPatterns: options.redactionPatterns }),
   })
   return { temp, upstream, writer, recorder }
 }
@@ -52,6 +58,113 @@ describe('record and strict replay', () => {
     const cassette = await loadCassette(temp.path())
     expect(cassette.interactions[0]?.request.storage).toBe('metadata')
     expect(JSON.stringify(cassette)).not.toContain('prompt:private')
+  })
+
+  it('redacts content without changing content-block discriminators or image media types', async () => {
+    const { temp, upstream, writer, recorder } = await setupRecorder({
+      redactSecrets: true,
+      requestStorage: 'full',
+      redactionPatterns: ['^secret-name$'],
+    })
+    const run = await recorder.start(request('structure'))
+    upstream.pending[0]?.resolve({
+      output: [{
+        type: 'image',
+        attachment: {
+          attachmentId: 'attachment-1',
+          mediaType: 'image/png',
+          bytes: 10,
+          width: 1,
+          height: 1,
+          name: 'secret-name',
+        },
+      }],
+      stopReason: 'completed',
+    } as unknown as SubagentResult)
+    await run.result
+    await run.dispose()
+    await writer.close()
+
+    const cassette = await loadCassette(temp.path())
+    const interaction = cassette.interactions[0]
+    expect(interaction?.request).toMatchObject({
+      storage: 'full',
+      value: { prompt: [{ type: 'text' }] },
+      redactions: 0,
+    })
+    expect(interaction?.outcome).toMatchObject({
+      kind: 'result',
+      result: {
+        output: [{
+          type: 'image',
+          attachment: { mediaType: 'image/png', name: '[REDACTED]' },
+        }],
+      },
+      redactions: 1,
+    })
+  })
+
+  it('rejects redaction patterns that would alter protected content-block fields', async () => {
+    const requestFixture = await setupRecorder({
+      redactSecrets: true,
+      requestStorage: 'full',
+      redactionPatterns: ['^secret-structure$'],
+    })
+    const unsafeRequest = request('structure')
+    unsafeRequest.prompt[0] = { type: 'secret-structure' } as never
+    await expect(requestFixture.recorder.start(unsafeRequest)).rejects.toMatchObject({
+      code: 'INVALID_CONFIG',
+    })
+    expect(requestFixture.upstream.pending).toHaveLength(0)
+    const validRun = await requestFixture.recorder.start(request('valid-after-rejection'))
+    requestFixture.upstream.pending[0]?.resolve(textResult('recorded'))
+    await validRun.result
+    await validRun.dispose()
+    await requestFixture.writer.close()
+    expect((await loadCassette(requestFixture.temp.path())).interactions)
+      .toMatchObject([{ sequence: 1 }])
+
+    const resultFixture = await setupRecorder({
+      redactSecrets: true,
+      redactionPatterns: ['^image/png$'],
+    })
+    const run = await resultFixture.recorder.start(request('structure'))
+    resultFixture.upstream.pending[0]?.resolve({
+      output: [{
+        type: 'image',
+        attachment: {
+          attachmentId: 'attachment-1',
+          mediaType: 'image/png',
+          bytes: 10,
+          width: 1,
+          height: 1,
+        },
+      }],
+      stopReason: 'completed',
+    } as unknown as SubagentResult)
+    await expect(run.result).rejects.toMatchObject({ code: 'INVALID_CONFIG' })
+    await run.dispose()
+    await resultFixture.writer.close()
+    expect((await loadCassette(resultFixture.temp.path())).interactions[0]?.outcome)
+      .toMatchObject({ kind: 'result-error' })
+  })
+
+  it('continues recording after an invalid parent context without topology gaps', async () => {
+    const { temp, upstream, writer, recorder } = await setupRecorder()
+    const invalidParent = {
+      ...fakeAgent('invalid-root'),
+      options: { provider: 'deepseek', model: 'deepseek-chat', maxTokens: Number.NaN },
+    }
+    await expect(recorder.start(request('invalid-parent', invalidParent))).rejects
+      .toThrow(/lossless plain JSON/)
+    expect(upstream.pending).toHaveLength(0)
+
+    const run = await recorder.start(request('valid-parent', fakeAgent('valid-root')))
+    upstream.pending[0]?.resolve(textResult('recorded'))
+    await run.result
+    await run.dispose()
+    await writer.close()
+    expect((await loadCassette(temp.path())).interactions).toMatchObject([{ sequence: 1 }])
   })
 
   it('continues occurrence numbers when a recording is appended', async () => {
@@ -449,6 +562,53 @@ describe('failures, redaction, and cancellation', () => {
     const run = await replay.start(request('slow', fakeAgent('fresh')))
     await run.dispose()
     await expect(run.result).resolves.toEqual({ output: [], stopReason: 'aborted' })
+  })
+
+  it('rejects underflowing replay speeds and overflowing scaled delays', async () => {
+    const temp = await tempWorkspace()
+    workspaces.push(temp)
+    const upstream = new QueueProvider()
+    const writer = await CassetteWriter.open(temp.path(), createHeader({
+      cassette: 'cassette', upstream: 'spawn', capabilities: upstream.capabilities,
+      inheritsParentContext: false, requestStorage: 'metadata', redactSecrets: false,
+    }), 'create')
+    const liveRequest = request('extreme-timing')
+    const canonical = await import('../src/canonical.ts')
+    const normalized = canonical.normalizeRequest(liveRequest)
+    await writer.append({
+      kind: 'cassette/interaction', sequence: 1, callKey: 'root/extreme~1', parentKey: 'root', occurrence: 1,
+      parentContextFingerprint: canonical.fingerprintParentContext(
+        canonical.normalizeParentContext(liveRequest.parent, false),
+      ),
+      requestFingerprint: canonical.fingerprintRequest(normalized),
+      request: { storage: 'metadata', metadata: canonical.requestMetadata(normalized) },
+      timing: {
+        startedAt: new Date().toISOString(),
+        startLatencyMs: Number.MAX_VALUE,
+        durationMs: Number.MAX_VALUE,
+      },
+      published: true,
+      local: false,
+      outcome: { kind: 'result', result: textResult('never delayed'), redactions: 0 },
+    })
+    await writer.close()
+    const cassette = await loadCassette(temp.path())
+
+    expect(() => new ReplaySubagentProvider(
+      'cassette',
+      new InteractionMatcher(cassette, 'reject', false),
+      cassette.header.provider,
+      { timing: 'recorded', speed: Number.MIN_VALUE },
+    )).toThrow(/greater than or equal to 0\.001/)
+
+    const replay = new ReplaySubagentProvider(
+      'cassette',
+      new InteractionMatcher(cassette, 'reject', false),
+      cassette.header.provider,
+      { timing: 'recorded', speed: 0.001 },
+    )
+    await expect(replay.start(request('extreme-timing', fakeAgent('fresh'))))
+      .rejects.toMatchObject({ code: 'INVALID_CONFIG' })
   })
 
   it('aborts replay before publication during recorded startup latency', async () => {

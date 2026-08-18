@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { runCli } from '../src/cli.ts'
 import { CassetteWriter, createHeader } from '../src/format.ts'
 import type { CliIo } from '../src/cli.ts'
+import type { CassetteOutcome } from '../src/types.ts'
 import { tempWorkspace, textResult, type TempWorkspace } from './helpers.ts'
 
 const workspaces: TempWorkspace[] = []
@@ -10,7 +11,11 @@ afterEach(async () => {
   await Promise.all(workspaces.splice(0).map(workspace => workspace.cleanup()))
 })
 
-async function fixture(firstOutput = 'private output'): Promise<string> {
+async function fixture(
+  firstOutput = 'private output',
+  stopReason = 'completed',
+  firstCallKey = 'root/audit~1',
+): Promise<string> {
   const temp = await tempWorkspace()
   workspaces.push(temp)
   const writer = await CassetteWriter.open(temp.path(), createHeader({
@@ -19,13 +24,17 @@ async function fixture(firstOutput = 'private output'): Promise<string> {
     inheritsParentContext: false, requestStorage: 'metadata', redactSecrets: false,
   }), 'create')
   await writer.append({
-    kind: 'cassette/interaction', sequence: 1, callKey: 'root/audit~1', parentKey: 'root', occurrence: 1,
+    kind: 'cassette/interaction', sequence: 1, callKey: firstCallKey, parentKey: 'root', occurrence: 1,
     parentContextFingerprint: `sha256:${'f'.repeat(64)}`,
     requestFingerprint: `sha256:${'a'.repeat(64)}`,
     request: { storage: 'metadata', metadata: { promptBlocks: 1, promptBytes: 20, hasOutputSchema: false, hasPersona: false } },
     timing: { startedAt: new Date().toISOString(), startLatencyMs: 1, durationMs: 12 },
     published: true, local: false,
-    outcome: { kind: 'result', result: textResult(firstOutput), redactions: 0 },
+    outcome: {
+      kind: 'result',
+      result: { ...textResult(firstOutput), stopReason },
+      redactions: 0,
+    } as unknown as CassetteOutcome,
   })
   await writer.append({
     kind: 'cassette/interaction', sequence: 2, callKey: 'root/failure~1', parentKey: 'root', occurrence: 1,
@@ -109,6 +118,74 @@ describe('cassette CLI', () => {
     expect(await runCli(['diff', expected, actual, '--show-calls'], human.io)).toBe(2)
     expect(human.out.join('\n')).toContain('outcome completed -> completed')
     expect(human.out.join('\n')).not.toContain('changed-private-output')
+  })
+
+  it('never prints raw unknown stop reasons in inspect or diff output', async () => {
+    const expectedReason = 'PRIVATE_EXPECTED_REASON\nINJECTED_LINE'
+    const actualReason = 'PRIVATE_ACTUAL_REASON\u001b[31m'
+    const expected = await fixture('same output', expectedReason)
+    const actual = await fixture('same output', actualReason)
+
+    for (const args of [
+      ['inspect', expected, '--json', '--show-calls'],
+      ['inspect', expected, '--show-calls'],
+      ['diff', expected, actual, '--json'],
+      ['diff', expected, actual, '--show-calls'],
+    ]) {
+      const captured = capture()
+      const exitCode = await runCli(args, captured.io)
+      expect(exitCode).toBe(args[0] === 'diff' ? 2 : 0)
+      const output = [...captured.out, ...captured.err].join('\n')
+      expect(output).not.toContain('PRIVATE_EXPECTED_REASON')
+      expect(output).not.toContain('PRIVATE_ACTUAL_REASON')
+      expect(output).toContain('other')
+    }
+  })
+
+  it('escapes control characters in cassette-derived human output', async () => {
+    const callKey = 'root/legit~1\nComparable / equivalent: yes / yes\u001b[31m'
+    const expected = await fixture('first', 'completed', callKey)
+    const actual = await fixture('second', 'completed', callKey)
+
+    const inspect = capture()
+    expect(await runCli(['inspect', expected, '--show-calls'], inspect.io)).toBe(0)
+    expect(inspect.out[1]).toContain('\\u{000a}')
+    expect(inspect.out[1]).toContain('\\u{001b}')
+    expect(inspect.out[1]).not.toContain('\n')
+    expect(inspect.out[1]).not.toContain('\u001b')
+
+    const diff = capture()
+    expect(await runCli(['diff', expected, actual, '--show-calls'], diff.io)).toBe(2)
+    const callLine = diff.out.find(line => line.startsWith('~ '))
+    expect(callLine).toContain('\\u{000a}')
+    expect(callLine).toContain('\\u{001b}')
+    expect(callLine).not.toContain('\n')
+    expect(callLine).not.toContain('\u001b')
+  })
+
+  it('escapes terminal-control Unicode while keeping JSON output valid', async () => {
+    const callKey = 'root/json\u2028line\u0085control\u200eformat\u{e0001}~1'
+    const expected = await fixture('first', 'completed', callKey)
+    const actual = await fixture('second', 'completed', callKey)
+
+    for (const args of [
+      ['inspect', expected, '--json', '--show-calls'],
+      ['diff', expected, actual, '--json'],
+    ]) {
+      const captured = capture()
+      expect(await runCli(args, captured.io)).toBe(args[0] === 'diff' ? 2 : 0)
+      const output = captured.out[0]
+      expect(output).toBeDefined()
+      expect(output).toContain('\\u2028')
+      expect(output).toContain('\\u0085')
+      expect(output).toContain('\\u200e')
+      expect(output).toContain('\\udb40\\udc01')
+      expect(output).not.toContain('\u2028')
+      expect(output).not.toContain('\u0085')
+      expect(output).not.toContain('\u200e')
+      expect(output).not.toContain('\u{e0001}')
+      expect(() => JSON.parse(output ?? '')).not.toThrow()
+    }
   })
 
   it('supports version and help without filesystem access', async () => {

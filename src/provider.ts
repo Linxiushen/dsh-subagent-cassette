@@ -26,6 +26,56 @@ function elapsed(started: number): number {
   return Math.max(0, Math.round((performance.now() - started) * 1_000) / 1_000)
 }
 
+function isRecord(value: JsonValue | undefined): value is Record<string, JsonValue> {
+  return value !== undefined && value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function contentStructureObjects(input: JsonValue, rootField: 'prompt' | 'output'): {
+  readonly blocks: WeakSet<object>
+  readonly attachments: WeakSet<object>
+} {
+  const blocks = new WeakSet<object>()
+  const attachments = new WeakSet<object>()
+  if (!isRecord(input)) return { blocks, attachments }
+  const root = input[rootField]
+  if (!Array.isArray(root)) return { blocks, attachments }
+  const pending: JsonValue[][] = [root]
+  for (let content = pending.pop(); content !== undefined; content = pending.pop()) {
+    for (const value of content) {
+      if (!isRecord(value) || typeof value['type'] !== 'string') continue
+      blocks.add(value)
+      if (value['type'] === 'image' && isRecord(value['attachment'])) {
+        attachments.add(value['attachment'])
+      }
+      if (value['type'] === 'tool-result' && Array.isArray(value['content'])) {
+        pending.push(value['content'])
+      }
+    }
+  }
+  return { blocks, attachments }
+}
+
+function redactBoundary<T extends JsonValue>(
+  input: T,
+  rootField: 'prompt' | 'output',
+  enabled: boolean,
+  patterns: readonly string[],
+) {
+  const structure = contentStructureObjects(input, rootField)
+  return redactJson(input, enabled, patterns, {
+    preserveString: (parent, key) => (
+      (key === 'type' && parent !== undefined && structure.blocks.has(parent))
+      || (key === 'mediaType' && parent !== undefined && structure.attachments.has(parent))
+    ),
+    onPreservedStringMatch: (_parent, key) => {
+      throw new CassetteError(
+        `redaction pattern matches protected content-block field "${key ?? '<unknown>'}"`,
+        'INVALID_CONFIG',
+      )
+    },
+  })
+}
+
 function errorFacts(error: unknown, redactSecrets: boolean, patterns: readonly string[]): RecordedError {
   const candidate: RecordedError = {
     name: error instanceof Error ? error.name : 'Error',
@@ -44,7 +94,7 @@ function storedRequest(
   patterns: readonly string[],
 ): StoredRequest {
   if (storage === 'metadata') return { storage, metadata: requestMetadata(request) }
-  const redacted = redactJson(request as unknown as JsonValue, redactSecrets, patterns)
+  const redacted = redactBoundary(request as unknown as JsonValue, 'prompt', redactSecrets, patterns)
   return {
     storage,
     value: redacted.value as unknown as ReturnType<typeof normalizeRequest>,
@@ -121,17 +171,18 @@ export class RecordingSubagentProvider implements SubagentProvider {
   }
 
   private async startTracked(request: ResolvedSubagentStartRequest): Promise<SubagentRun> {
-    const reserved = this.topology.reserve(request)
-    const sequence = this.sequence++
-    const started = performance.now()
-    const startedAt = new Date().toISOString()
     const patterns = this.options.redactionPatterns ?? []
+    const normalizedRequest = normalizeRequest(request)
     const requestView = storedRequest(
-      reserved.request,
+      normalizedRequest,
       this.options.requestStorage,
       this.options.redactSecrets,
       patterns,
     )
+    const reserved = this.topology.reserve(request, normalizedRequest)
+    const sequence = this.sequence++
+    const started = performance.now()
+    const startedAt = new Date().toISOString()
     let signalAbortedAtMs: number | undefined = request.signal.aborted ? 0 : undefined
     const onAbort = (): void => { signalAbortedAtMs ??= elapsed(started) }
     request.signal.addEventListener('abort', onAbort, { once: true })
@@ -256,7 +307,12 @@ export class RecordingSubagentProvider implements SubagentProvider {
       let redactionCount: number
       try {
         snapshot = snapshotResult(settled)
-        const redacted = redactJson(snapshot as unknown as JsonValue, this.options.redactSecrets, patterns)
+        const redacted = redactBoundary(
+          snapshot as unknown as JsonValue,
+          'output',
+          this.options.redactSecrets,
+          patterns,
+        )
         stored = redacted.value as unknown as SubagentResult
         redactionCount = redacted.count
       } catch (error: unknown) {
@@ -341,6 +397,9 @@ function abortResult(): SubagentResult {
 }
 
 async function waitFor(ms: number, signal: AbortSignal): Promise<'elapsed' | 'aborted'> {
+  if (!Number.isFinite(ms) || ms < 0) {
+    throw new CassetteError('cassette replay delay must be a non-negative finite number', 'INVALID_CONFIG')
+  }
   if (signal.aborted) return 'aborted'
   if (ms <= 0) return 'elapsed'
   const maximumTimerDelayMs = 2_147_483_647
@@ -369,10 +428,21 @@ export interface ReplayProviderOptions {
   readonly speed: number
 }
 
+export const MINIMUM_REPLAY_SPEED = 0.001
+
+function scaledDelay(ms: number, scale: number): number {
+  const delay = ms * scale
+  if (!Number.isFinite(delay)) {
+    throw new CassetteError('recorded cassette timing cannot be scaled to a finite delay', 'INVALID_CONFIG')
+  }
+  return delay
+}
+
 /** Offline provider that returns strictly matched cassette outcomes. */
 export class ReplaySubagentProvider implements SubagentProvider {
   readonly capabilities
   readonly inheritsParentContext: boolean
+  private readonly options: ReplayProviderOptions
 
   constructor(
     readonly name: string,
@@ -381,16 +451,26 @@ export class ReplaySubagentProvider implements SubagentProvider {
       readonly capabilities: SubagentProvider['capabilities']
       readonly inheritsParentContext: boolean
     },
-    private readonly options: ReplayProviderOptions,
+    options: ReplayProviderOptions,
   ) {
+    if (options.timing !== 'instant' && options.timing !== 'recorded') {
+      throw new CassetteError('timing must be "instant" or "recorded"', 'INVALID_CONFIG')
+    }
+    if (!Number.isFinite(options.speed) || options.speed < MINIMUM_REPLAY_SPEED) {
+      throw new CassetteError(
+        `speed must be a finite number greater than or equal to ${MINIMUM_REPLAY_SPEED}`,
+        'INVALID_CONFIG',
+      )
+    }
     this.capabilities = { ...providerFacts.capabilities }
     this.inheritsParentContext = providerFacts.inheritsParentContext
+    this.options = { ...options }
   }
 
   async start(request: ResolvedSubagentStartRequest): Promise<SubagentRun> {
     const interaction = this.matcher.match(request)
     const scale = this.options.timing === 'recorded' ? 1 / this.options.speed : 0
-    const startWait = interaction.timing.startLatencyMs * scale
+    const startWait = scaledDelay(interaction.timing.startLatencyMs, scale)
     if (await waitFor(startWait, request.signal) === 'aborted') {
       throw new CassetteRecordedError('cassette replay aborted before subagent publication', 'AbortError', 'ABORTED')
     }
@@ -399,7 +479,10 @@ export class ReplaySubagentProvider implements SubagentProvider {
 
     const controller = new AbortController()
     const runSignal = AbortSignal.any([request.signal, controller.signal])
-    const remaining = Math.max(0, interaction.timing.durationMs - interaction.timing.startLatencyMs) * scale
+    const remaining = scaledDelay(
+      Math.max(0, interaction.timing.durationMs - interaction.timing.startLatencyMs),
+      scale,
+    )
     const result = (async (): Promise<SubagentResult> => {
       if (await waitFor(remaining, runSignal) === 'aborted') return abortResult()
       if (outcome.kind === 'result-error') throw recordedError(interaction)

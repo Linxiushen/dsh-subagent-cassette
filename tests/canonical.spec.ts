@@ -162,9 +162,29 @@ describe('canonical request identity', () => {
     })
     expect(JSON.stringify(metadata)).not.toContain('prompt:private-label')
   })
+
+  it('rejects runtime tool-filter fields outside the DSH allow/deny contract', () => {
+    const invalid = {
+      ...request('invalid-filter'),
+      toolFilter: { allow: ['read'], privatePrompt: 'TOP_SECRET' },
+    }
+    expect(() => normalizeRequest(invalid)).toThrow(/toolFilter\.privatePrompt is not supported/)
+  })
 })
 
 describe('canonical parent context identity', () => {
+  it('does not reserve a root when parent-context fingerprinting fails', () => {
+    const topology = new TopologyTracker(false)
+    const invalidParent = {
+      ...fakeAgent('invalid-root'),
+      options: { provider: 'deepseek', model: 'deepseek-chat', maxTokens: Number.NaN },
+    }
+    expect(() => topology.reserve(request('invalid', invalidParent))).toThrow(/lossless plain JSON/)
+
+    const reserved = topology.reserve(request('valid', fakeAgent('valid-root')))
+    expect(reserved).toMatchObject({ parentKey: 'root', occurrence: 1 })
+  })
+
   it('normalizes volatile session, message, and correlated tool-call ids', () => {
     const first = agentWith('session-a', { events: completedHistory('a', 'same', 'random-a') })
     const second = agentWith('session-b', { events: completedHistory('b', 'same', 'random-b') })

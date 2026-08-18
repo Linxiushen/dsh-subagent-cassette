@@ -11,6 +11,7 @@ import type {
   JsonValue,
   NormalizedParentContext,
   NormalizedSubagentRequest,
+  NormalizedToolFilter,
   RequestMetadata,
 } from './types.ts'
 
@@ -64,6 +65,29 @@ export function canonicalStringify(value: JsonValue): string {
   return output.join('')
 }
 
+function normalizeToolFilter(value: unknown): NormalizedToolFilter | undefined {
+  if (value === undefined) return
+  if (value === null || Array.isArray(value) || typeof value !== 'object') {
+    throw new TypeError('subagent cassette toolFilter must be an object')
+  }
+  const filter = value as Record<string, unknown>
+  const extra = Object.keys(filter).find(field => field !== 'allow' && field !== 'deny')
+  if (extra !== undefined) {
+    throw new TypeError(`subagent cassette toolFilter.${extra} is not supported`)
+  }
+  const projection: { allow?: string[]; deny?: string[] } = {}
+  for (const field of ['allow', 'deny']) {
+    const names = filter[field]
+    if (names === undefined) continue
+    if (!Array.isArray(names) || names.some(name => typeof name !== 'string')) {
+      throw new TypeError(`subagent cassette toolFilter.${field} must be an array of strings`)
+    }
+    if (field === 'allow') projection.allow = [...names]
+    else projection.deny = [...names]
+  }
+  return projection
+}
+
 /** SHA-256 digest over canonical JSON. */
 export function fingerprintJson(value: JsonValue): string {
   return `sha256:${createHash('sha256').update(canonicalStringify(value)).digest('hex')}`
@@ -84,7 +108,12 @@ export function normalizeRequest(request: ResolvedSubagentStartRequest): Normali
   if (snapshot === undefined) {
     throw new TypeError('subagent cassette request is not lossless plain JSON')
   }
-  return snapshot as unknown as NormalizedSubagentRequest
+  const normalized = snapshot as unknown as NormalizedSubagentRequest
+  const toolFilter = normalizeToolFilter(normalized.toolFilter)
+  return {
+    ...normalized,
+    ...(toolFilter === undefined ? {} : { toolFilter }),
+  }
 }
 
 /** Fingerprint a request without its signal, parent identity, or generated descriptor provider. */
@@ -248,6 +277,7 @@ export function requestMetadata(request: NormalizedSubagentRequest): RequestMeta
     : undefined
   const provider = options?.['provider']
   const model = options?.['model']
+  const toolFilter = normalizeToolFilter(request.toolFilter)
   return {
     ...(request.label === undefined ? {} : { label: request.label }),
     promptBlocks: request.prompt.length,
@@ -256,7 +286,7 @@ export function requestMetadata(request: NormalizedSubagentRequest): RequestMeta
     ...(request.maxDepth === undefined ? {} : { maxDepth: request.maxDepth }),
     ...(typeof provider === 'string' ? { childProvider: provider } : {}),
     ...(typeof model === 'string' ? { childModel: model } : {}),
-    ...(request.toolFilter === undefined ? {} : { toolFilter: request.toolFilter }),
+    ...(toolFilter === undefined ? {} : { toolFilter }),
     hasPersona: request.persona !== undefined,
   }
 }

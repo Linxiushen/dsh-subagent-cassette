@@ -127,9 +127,11 @@ pnpm exec dsh-cassette inspect .dsh-cassettes/repository-audit.cassette.jsonl --
 pnpm exec dsh-cassette diff baseline.cassette.jsonl candidate.cassette.jsonl --json
 ```
 
-`inspect` 只输出元数据、call key、指纹、outcome 类型、stop reason 和耗时，不输出已保存的 prompt 或结果正文。但 label 会出现在元数据和可读 call key 中，因此 CLI 输出不一定匿名。
+`inspect` 只输出元数据、call key、指纹、outcome 类型、stop reason 分类和耗时。stop reason 仅分为 `completed`、`aborted`、`error`、`max-tokens`、`refusal` 或 `other`；未来 DSH 出现未知值时只输出 `other`。Human 输出会转义 cassette 派生文本中的控制字符、格式字符和行分隔符，JSON 输出则使用合法 JSON 转义。它不会输出已保存的 prompt、结果正文或未知 stop reason 原值。但 label 会出现在元数据和可读 call key 中，因此 CLI 输出不一定匿名。
 
 `diff` 只按完整稳定身份 `(parent key, parent-context fingerprint, request fingerprint, occurrence)` 对齐，分别报告新增、删除、结果变化、边界变化和录制策略漂移。Timing delta 只作信息展示，不影响等价判定。退出码 `0` 表示等价，`2` 表示存在差异或无法安全比较，`1` 表示参数、读取或格式错误。遇到歧义重复组或父上下文继承语义变化时会 fail closed，不进行猜测式对齐。
+
+Cassette 加载也会在持久化请求边界 fail closed。metadata/full 请求视图只能包含文档列出的字段，并且每条 interaction 的 `request.storage` 必须与 header 的 `requestStorage` 策略一致。这些检查先于 replay、inspect、diff 或 append 执行。本次加固不改变 cassette 格式版本 `1`，也不改变精确的 DSH `0.1.0-rc.7` 目标。
 
 ### 3. 离线回放
 
@@ -159,12 +161,12 @@ replay 会在注册 provider 前读取并校验当前完整文件，同时按策
 | `provider` | 通用 | `cassette` | 注册到 `ctx.subagents` 的名称。 |
 | `file` | 通用 | 带时间戳的路径 | Cassette JSONL 路径；replay 应始终显式指定固定路径。 |
 | `redactSecrets` | record | `true` | 录制时启用内置 key 和字符串脱敏；该策略写入 header，并用于 append 兼容校验。replay 使用文件中的既有数据并忽略此项。 |
-| `redactionPatterns` | record | `[]` | 额外 JavaScript 正则源码，按全局、忽略大小写方式编译。replay 不会对已加载数据重新脱敏。 |
+| `redactionPatterns` | record | `[]` | 额外 JavaScript 正则源码，按全局、忽略大小写方式编译。若规则命中 content block 的 `type` 或图片 `mediaType`，录制会被拒绝，因为这些字段属于结构字段。replay 不会对已加载数据重新脱敏。 |
 | `upstreamProvider` | record | `spawn` | 接收真实调用的 provider，不能与 `provider` 相同。 |
 | `writeMode` | record | `create` | `create` 拒绝覆盖；`truncate` 替换；`append` 校验并续写兼容文件。若另一个 writer 已锁定目标，所有模式都会立即失败。 |
 | `requestStorage` | record | `metadata` | `metadata` 不写 prompt 正文；`full` 写入脱敏后的规范化请求。 |
 | `timing` | replay | `instant` | `instant` 不等待；`recorded` 复现录制的边界延时。 |
-| `speed` | replay | `1` | `recorded` 模式的正有限加速倍数；`2` 表示两倍速。 |
+| `speed` | replay | `1` | `recorded` 模式下至少为 `0.001` 的有限加速倍数；`2` 表示两倍速，缩放后的延时也必须保持有限。 |
 | `duplicatePolicy` | replay | `reject` | 拒绝同 parent-context/请求组的不同结果，或显式用 `sequence` 按 occurrence 匹配。 |
 | `allowRedactedReplay` | replay | `false` | 允许返回包含脱敏替代值的成功结果。 |
 | `assertConsumed` | replay | `true` | dispose 时如果仍有未匹配 interaction，则抛错。 |
@@ -217,11 +219,11 @@ replay 会在注册 provider 前读取并校验当前完整文件，同时按策
 - `parent-and-request-changed`
 - `parent-not-found`
 
-`match()` 失败时，同一个结构化对象会出现在 `CassetteMismatchError.diagnostic`。候选按录制时的 admission sequence 确定性排序，并标记是否已消费。诊断只包含 call key、指纹、occurrence 和请求元数据，不包含已保存的 prompt、result 或 error 正文；候选仅用于解释失败，绝不参与模糊匹配。
+`match()` 失败时，同一个结构化对象会出现在 `CassetteMismatchError.diagnostic`。候选按录制时的 admission sequence 确定性排序，并标记是否已消费。请求规范化、父上下文指纹或精确匹配失败时不会预留新 root 或 occurrence，因此修正后的调用可以重试，不会继承被污染的拓扑状态。matcher 会按显式字段白名单重新构造候选元数据，而不是直接返回已保存的 metadata 对象，因此伪造字段或未来新增字段不能通过该路径泄漏。诊断只包含 call key、指纹、occurrence 和获准的请求元数据，不包含已保存的 prompt、result 或 error 正文；候选仅用于解释失败，绝不参与模糊匹配。
 
 ## 完整性边界
 
-JSONL 每条记录都含 canonical SHA-256 hash，每个 interaction 还指向物理上的上一条记录。校验可以发现非法 JSON、不支持的 schema/目标版本、内容修改、中间记录删除、重排、重复 key/occurrence、很多部分写入，以及当前可见链条断裂。
+JSONL 每条记录都含 canonical SHA-256 hash，每个 interaction 还指向物理上的上一条记录。校验可以发现非法 JSON、重复 object member、无法无损 canonical 化的数值、不支持的 schema/目标版本、内容修改、中间记录删除、重排、重复 call key/occurrence、很多部分写入，以及当前可见链条断裂。
 
 它不能认证文件，不能阻止恶意编辑者重算 hash；如果没有外部预期的尾 hash 或记录数，也无法发现一个完整有效的后缀被整体删除。Cassette 仍需置于正常的源码管理或 artifact store 完整性控制下。精确保证见[格式文档](docs/format.md#integrity-and-validation)。
 

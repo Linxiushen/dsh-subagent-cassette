@@ -9,13 +9,21 @@ export const CASSETTE_VERSION = 1
 export const TARGET_DSH_SUBAGENT_VERSION = '0.1.0-rc.7'
 
 export type JsonPrimitive = null | boolean | number | string
-export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue }
+export type JsonObject = { [key: string]: JsonValue }
+export type JsonValue = JsonPrimitive | JsonValue[] | JsonObject
 
 export type CassetteMode = 'record' | 'replay'
 export type CassetteWriteMode = 'create' | 'append' | 'truncate'
 export type RequestStorage = 'metadata' | 'full'
 export type ReplayTiming = 'instant' | 'recorded'
 export type DuplicatePolicy = 'reject' | 'sequence'
+export type CassetteStopReasonCategory =
+  | 'completed'
+  | 'aborted'
+  | 'error'
+  | 'max-tokens'
+  | 'refusal'
+  | 'other'
 export type CassetteMismatchReason =
   | 'group-exhausted'
   | 'parent-context-changed'
@@ -52,11 +60,16 @@ export interface CassetteHeader extends CassetteHeaderBody {
 export interface NormalizedSubagentRequest {
   readonly label?: string
   readonly prompt: ContentBlock[]
-  readonly agentOptions?: JsonValue
-  readonly outputSchema?: JsonValue
+  readonly agentOptions?: JsonObject
+  readonly outputSchema?: JsonObject
   readonly maxDepth?: number
-  readonly toolFilter?: JsonValue
+  readonly toolFilter?: NormalizedToolFilter
   readonly persona?: string
+}
+
+export interface NormalizedToolFilter {
+  readonly allow?: string[]
+  readonly deny?: string[]
 }
 
 export interface NormalizedParentContext {
@@ -85,7 +98,7 @@ export interface RequestMetadata {
   readonly maxDepth?: number
   readonly childProvider?: string
   readonly childModel?: string
-  readonly toolFilter?: JsonValue
+  readonly toolFilter?: NormalizedToolFilter
   readonly hasPersona: boolean
 }
 

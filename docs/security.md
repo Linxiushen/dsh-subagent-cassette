@@ -22,7 +22,7 @@ This project does not defend against:
 - malicious instructions or data contained in a valid recorded result;
 - compromise of the record-time upstream provider, model, or host process.
 
-The cassette parser performs structural validation. It is not a sandbox or a content-safety engine.
+The cassette parser performs structural validation. It rejects duplicate JSON object members before trusting the parsed value, so an overwritten raw member cannot sit outside the canonical record hash. It is not a sandbox or a content-safety engine.
 
 ## Data written during recording
 
@@ -50,13 +50,13 @@ Redaction is enabled by default while recording. It recursively:
 
 The replacement value is `[REDACTED]`.
 
-Redaction applies to persisted full requests, successful results, and the selected fields of recorded errors. It does not mutate the successful result returned to the record-mode caller. Raw request and parent-context fingerprints are computed before redaction; their source text is not written, but dictionary testing remains possible.
+Redaction applies to persisted full requests, successful results, and the selected fields of recorded errors. For request `prompt` and result `output` content trees, it is schema-aware: every content block's `type` discriminator and every image attachment's `mediaType` are protected from substitution. If any built-in or configured pattern would alter one of those structural strings, recording fails with `INVALID_CONFIG` instead of silently bypassing the pattern or writing an unloadable record. Other strings, including image names and block payloads, remain eligible for redaction. Redaction does not mutate a successful result returned to the record-mode caller when persistence succeeds. Raw request and parent-context fingerprints are computed before redaction; their source text is not written, but dictionary testing remains possible.
 
 ### Redaction limitations
 
 - Key matching uses a finite normalized-key/suffix list, not a semantic secret classifier.
 - Encoded, fragmented, novel, binary, or context-specific credentials can be missed.
-- Overbroad patterns can destroy valid output.
+- Overbroad patterns can destroy valid payload semantics or reject a recording when they match a protected structural field.
 - Custom regexes execute in the recording process. Treat configuration as trusted and avoid catastrophic-backtracking expressions.
 - Error outcomes do not carry a redaction count in format version 1.
 - Disabling redaction stores snapshots as supplied and should be restricted to synthetic fixtures.
@@ -99,13 +99,19 @@ Do not use the internal record hashes as a substitute for artifact signing.
 
 Loading performs synchronous JSON parsing and canonical hashing over the whole file content after an asynchronous read. Only load cassettes from bounded, trusted storage in production-like processes. Large files can consume memory and CPU even when structurally valid.
 
+Cassette-owned wrappers are closed schemas: unknown fields are rejected on headers, provider facts and capabilities, interactions, timing, request views, outcomes, and recorded errors. DSH result bodies and unknown typed content blocks remain deliberate extension points. Content-block traversal and persistence redaction use iterative worklists; the format regression suite exercises 20,000 nested `tool-result` blocks without recursive or quadratic path construction. This removes a stack-depth failure mode but does not remove the overall size-based denial-of-service limit above.
+
 Recorded results should be treated as untrusted external data at the application boundary, just like live provider output. Replay intentionally returns them; it does not sanitize commands, URLs, markup, tool arguments, or prompt-injection content.
 
 ## Diagnostic and diff output
 
-Structured mismatch diagnostics project only parent/call keys, request and parent-context fingerprints, occurrences, consumption state, and the request metadata already used by metadata-mode cassettes. They do not include live or stored prompt bodies, result bodies, or recorded error messages. Cassette diff reports use the same boundary and represent outcomes only by terminal metadata and unsalted SHA-256 fingerprints.
+Structured mismatch diagnostics project only parent/call keys, request and parent-context fingerprints, occurrences, consumption state, and the request metadata already used by metadata-mode cassettes. `InteractionMatcher` rebuilds candidate metadata from an explicit allowlist rather than returning a stored object directly. This is defense in depth for programmatically constructed or forged cassette objects and for fields a future format may add. Diagnostics do not include live or stored prompt bodies, result bodies, recorded error messages, or unapproved metadata fields. Cassette diff reports use the same boundary and represent outcomes only by terminal metadata and unsalted SHA-256 fingerprints.
+
+Inspect and diff expose stop reasons through the bounded categories `completed`, `aborted`, `error`, `max-tokens`, `refusal`, and `other`. An unknown future DSH string maps to `other`; its raw value is not included in human or JSON diagnostic output. The raw string remains inside the persisted result, is returned by replay, and contributes to exact outcome fingerprint comparison. Treat it as sensitive cassette content even though metadata-facing reports suppress it.
 
 This output is metadata-safe, not anonymous or cryptographically private. Labels, tool filters, provider/model names, topology paths, byte counts, filesystem paths printed by the human CLI, and low-entropy fingerprints can still disclose or confirm sensitive facts. Outcome fingerprints can likewise be checked against guessed low-entropy results or errors. Apply the same log access and retention controls used for cassette metadata.
+
+Human CLI output and CLI errors escape Unicode control, format, line-separator, and paragraph-separator characters as visible `\u{...}` sequences before writing to a terminal. JSON mode encodes the same characters inside string literals with valid JSON escapes, including surrogate pairs for non-BMP characters. This prevents cassette-derived call keys, provider facts, paths, or errors from injecting forged lines, ANSI control sequences, or invisible formatting while keeping JSON output parseable.
 
 `InteractionMatcher.describe()` is a legacy low-level debugging API that returns a canonical representation containing the normalized live request, including prompt content. Do not log or publish its result. Prefer `diagnose()` and `CassetteMismatchError.diagnostic` for metadata-safe failure reporting.
 

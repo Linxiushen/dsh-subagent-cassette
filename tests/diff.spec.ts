@@ -170,4 +170,34 @@ describe('cassette diff', () => {
     expect(serialized).not.toContain(actualSecret)
     expect(serialized).toContain('outcomeFingerprint')
   })
+
+  it('maps private extensible stop reasons to a bounded category', () => {
+    const expectedReason = 'PRIVATE_EXPECTED_REASON'
+    const actualReason = 'PRIVATE_ACTUAL_REASON'
+    const expected = cassette([interaction({
+      key: 'private-reason',
+      outcome: {
+        kind: 'result',
+        result: { ...textResult('same'), stopReason: expectedReason },
+        redactions: 0,
+      } as unknown as CassetteOutcome,
+    })])
+    const actual = cassette([interaction({
+      key: 'private-reason',
+      outcome: {
+        kind: 'result',
+        result: { ...textResult('same'), stopReason: actualReason },
+        redactions: 0,
+      } as unknown as CassetteOutcome,
+    })])
+
+    const result = diffCassettes(expected, actual)
+    const serialized = JSON.stringify(result)
+    expect(result.outcomeChanged[0]).toMatchObject({
+      expected: { stopReason: 'other' },
+      actual: { stopReason: 'other' },
+    })
+    expect(serialized).not.toContain(expectedReason)
+    expect(serialized).not.toContain(actualReason)
+  })
 })

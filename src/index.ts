@@ -8,6 +8,7 @@ import {
 } from './format.ts'
 import { CassetteError } from './errors.ts'
 import {
+  MINIMUM_REPLAY_SPEED,
   RecordingSubagentProvider,
   ReplaySubagentProvider,
 } from './provider.ts'
@@ -44,6 +45,7 @@ export type {
 export {
   ambiguousGroups,
   CassetteWriter,
+  classifyStopReason,
   createHeader,
   loadCassette,
   parseCassette,
@@ -72,6 +74,7 @@ export type {
   CassetteMismatchDiagnostic,
   CassetteMismatchReason,
   CassetteSummary,
+  CassetteStopReasonCategory,
   CassetteWriteMode,
   DuplicatePolicy,
   InstallConfig,
@@ -110,7 +113,7 @@ export const Config: z<Config> = z.object({
   redactSecrets: z.boolean().default(true),
   redactionPatterns: z.array(z.string()).default([]),
   timing: z.union(['instant', 'recorded'] as const).default('instant'),
-  speed: z.number().min(0.001).default(1),
+  speed: z.number().min(MINIMUM_REPLAY_SPEED).default(1),
   duplicatePolicy: z.union(['reject', 'sequence'] as const).default('reject'),
   allowRedactedReplay: z.boolean().default(false),
   assertConsumed: z.boolean().default(true),
@@ -196,8 +199,11 @@ export async function installCassette(ctx: Context, config: InstallConfig): Prom
   const path = resolveCassettePath(config.file)
   const cassette = await loadCassette(path)
   const speed = config.speed ?? 1
-  if (!Number.isFinite(speed) || speed <= 0) {
-    throw new CassetteError('speed must be a positive finite number', 'INVALID_CONFIG')
+  if (!Number.isFinite(speed) || speed < MINIMUM_REPLAY_SPEED) {
+    throw new CassetteError(
+      `speed must be a finite number greater than or equal to ${MINIMUM_REPLAY_SPEED}`,
+      'INVALID_CONFIG',
+    )
   }
   const matcher = new InteractionMatcher(
     cassette,

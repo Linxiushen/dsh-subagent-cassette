@@ -9,6 +9,7 @@
 - Line 1: exactly one `cassette/header` record.
 - Remaining lines: zero or more `cassette/interaction` records.
 - Blank lines are ignored by the parser.
+- Duplicate object member names are rejected at every nesting level, including names that become equal after JSON escape decoding.
 
 The file suffix `.cassette.jsonl` is conventional, not part of validation.
 
@@ -21,6 +22,8 @@ Record hashes and request/parent-context fingerprints use the project's canonica
 - strings, booleans, and `null` use JSON encoding;
 - numbers must be finite and must not be negative zero;
 - undefined and non-lossless values are rejected.
+
+Input lines do not need canonical key order or whitespace, but each parsed record must be losslessly canonicalizable. Canonicalization failures are reported as `CassetteFormatError` rather than leaking a raw serializer exception.
 
 Digest strings use this shape:
 
@@ -70,6 +73,8 @@ A conceptual header is:
 | `requestStorage` | Persistence policy used for all interaction request views. |
 | `redactSecrets`, `redactionPatterns` | Persistence redaction policy used when recording. |
 | `hash` | Hash of the complete header body with `hash` omitted. |
+
+Format version `1` treats the cassette-owned header wrappers as closed schemas. The header, `target`, `provider`, and `provider.capabilities` objects accept only the fields shown above; unknown fields are rejected instead of being ignored or carried into later tooling.
 
 ## Interaction
 
@@ -147,6 +152,8 @@ Metadata storage has this union arm:
 
 Optional keys are omitted when absent. Metadata mode does not write prompt content, `agentOptions` in full, `outputSchema` in full, or the persona string.
 
+The metadata arm is closed to extension in format version `1`. Its outer object accepts only `storage` and `metadata`; `metadata` accepts only `label`, `promptBlocks`, `promptBytes`, `hasOutputSchema`, `maxDepth`, `childProvider`, `childModel`, `toolFilter`, and `hasPersona`. `promptBlocks`, `promptBytes`, and optional `maxDepth` are non-negative safe integers; `hasOutputSchema` and `hasPersona` are required booleans. When present, `label`, `childProvider`, and `childModel` are strings, while `toolFilter` contains only optional `allow` and `deny` string arrays. Unknown fields are rejected rather than ignored.
+
 Full storage has this shape:
 
 ```json
@@ -162,6 +169,14 @@ Full storage has this shape:
 
 `value` is the redacted normalized request. `requestFingerprint` is computed before redaction, so redacting stored request text does not change matching identity.
 
+The full arm is likewise closed: its outer object accepts only `storage`, `value`, and `redactions`, while `value` accepts only `label`, `prompt`, `agentOptions`, `outputSchema`, `maxDepth`, `toolFilter`, and `persona`. `prompt` is a required array of typed content blocks; optional `agentOptions` and `outputSchema` are objects; optional `label` and `persona` are strings; optional `maxDepth` and required `redactions` are non-negative safe integers; and `toolFilter` contains only optional `allow` and `deny` string arrays. Unknown outer or request-value fields are rejected.
+
+Persistence redaction protects content-block `type` discriminators and image attachment `mediaType` values from substitution. A built-in or configured pattern that would alter either structural field rejects recording with `INVALID_CONFIG`; it is never silently skipped and cannot produce an unloadable redacted request or result.
+
+Every interaction's `request.storage` must equal the header's `requestStorage`. A file cannot mix metadata and full request views under one header; replay, inspection, diff, and append all reject that policy inconsistency while loading the cassette.
+
+Record-mode request normalization rejects runtime `toolFilter` objects outside the same allow/deny contract before invoking the upstream provider. `createHeader()` validates its result, and `CassetteWriter` revalidates the requested header before any filesystem mutation plus every complete interaction before writing it. Direct programmatic callers therefore cannot create a document that the loader would reject under these rules.
+
 ### Timing
 
 | Field | Meaning |
@@ -173,6 +188,8 @@ Full storage has this shape:
 | `disposeCalledAtMs` | Optional observed run disposal offset. It is diagnostic, not automatically reenacted. |
 
 Values are rounded to microsecond-shaped decimal precision but should be treated as ordinary non-negative finite millisecond measurements, not high-accuracy wall-clock evidence.
+
+Replay configuration independently requires `timing` to be `instant` or `recorded` and `speed` to be a finite number greater than or equal to `0.001`. Before any timer is scheduled, both the scaled start latency and scaled remaining duration must still be non-negative finite values; replay rejects an unrepresentable delay with `INVALID_CONFIG`.
 
 ### Publication and locality
 
@@ -197,7 +214,9 @@ Successful boundary result:
 }
 ```
 
-`result` must at least contain `output` as an array and `stopReason` as a string. Other valid `SubagentResult` data, such as structured output, remains in the snapshot.
+`result` must at least contain `output` as an array of typed content blocks and `stopReason` as a string. The parser validates required fields for the five built-in block types and validates nested `tool-result.content` with an iterative worklist. Validation is linear in the number of visited blocks rather than recursive or proportional to the rendered path length; a regression fixture covers 20,000 nested `tool-result` blocks. An unknown typed block remains available for DSH's extension mechanism. Other valid `SubagentResult` data, such as structured output, remains in the snapshot.
+
+The stored stop reason remains an extensible DSH string and is replayed as recorded. Metadata-facing inspect and diff output projects it into `completed`, `aborted`, `error`, `max-tokens`, `refusal`, or `other`; every unknown value becomes `other`, and its raw text is not emitted. The exact stored outcome, including an unknown stop reason, still participates in the canonical outcome fingerprint used for diff equivalence.
 
 Startup failure:
 
@@ -219,6 +238,8 @@ Post-publication infrastructure or serialization failure:
 
 Only `name`, `message`, and an optional string `code` are persisted for errors. Error messages are redacted when redaction is enabled, but this version does not record an error-redaction count.
 
+Cassette-owned interaction wrappers are closed schemas: the interaction record, `timing`, and each outcome arm reject unknown fields. A `result` outcome accepts only `kind`, `result`, and `redactions`; an error outcome accepts only `kind` and `error`; and the recorded error accepts only `name`, `message`, and optional `code`. The nested DSH `SubagentResult` and typed content-block objects deliberately remain extensible, so future result data and unknown block types survive when their minimum boundary shape is valid.
+
 ## Integrity and validation
 
 The header hash is:
@@ -238,6 +259,9 @@ The interaction hash includes `previousHash`. The parser also checks:
 - exact format, schema version, and DSH target;
 - provider capability field types;
 - field types and numeric ranges;
+- closed cassette-owned header/target/provider/capability, interaction, timing, outcome/error, and request-view wrappers;
+- interaction request-storage agreement with the header policy;
+- duplicate JSON object members and lossless canonical-number constraints;
 - result minimum shape;
 - publication/locality invariants;
 - unique sequence and call keys;
@@ -283,3 +307,5 @@ Default replay rejects the entire cassette if any ambiguous group exists. `dupli
 ## Compatibility policy
 
 Format version and DSH target are exact, fail-closed fields. A reader does not silently accept a different target even if its shape appears similar. A future incompatible change should increment `version` and document migration or regeneration rather than weakening validation.
+
+The public TypeScript surface mirrors these runtime boundaries: `JsonObject` is recursively JSON-valued, normalized `agentOptions` and `outputSchema` are objects, prompts are DSH `ContentBlock[]`, results are DSH `SubagentResult`, and `NormalizedToolFilter` contains only optional `allow` and `deny` string arrays. This tightening does not close the deliberately extensible `SubagentResult` or unknown typed content blocks described above.

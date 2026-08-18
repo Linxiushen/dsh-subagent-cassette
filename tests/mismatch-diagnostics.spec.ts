@@ -147,6 +147,23 @@ describe('structured mismatch diagnostics', () => {
     expect(matcher.match(request('known', fakeAgent('valid-root'))).callKey).toContain('known')
   })
 
+  it('does not reserve a root when parent fingerprinting or exact matching fails', async () => {
+    const cassette = await fixture('metadata', [{ sequence: 1, request: request('known') }])
+
+    const invalidContextMatcher = new InteractionMatcher(cassette, 'reject', false)
+    const invalidParent = {
+      ...fakeAgent('invalid-root'),
+      options: { provider: 'deepseek', model: 'deepseek-chat', maxTokens: Number.NaN },
+    }
+    expect(() => invalidContextMatcher.match(request('known', invalidParent))).toThrow(/lossless plain JSON/)
+    expect(invalidContextMatcher.match(request('known', fakeAgent('valid-root'))).callKey).toContain('known')
+
+    const mismatchMatcher = new InteractionMatcher(cassette, 'reject', false)
+    expect(() => mismatchMatcher.match(request('unknown', fakeAgent('mismatch-root'))))
+      .toThrow(CassetteMismatchError)
+    expect(mismatchMatcher.match(request('known', fakeAgent('valid-root'))).callKey).toContain('known')
+  })
+
   it('distinguishes parent context drift from request drift', async () => {
     const recordedParent = { ...fakeAgent('recorded'), options: { model: 'deepseek-chat' } }
     const cassette = await fixture('metadata', [{
@@ -259,6 +276,38 @@ describe('structured mismatch diagnostics', () => {
       expect(errorText).not.toContain('LIVE_PROMPT_SECRET')
     },
   )
+
+  it('projects stored and live metadata through a nested allowlist', async () => {
+    const cassette = await fixture('metadata', [{ sequence: 1, request: request('known') }])
+    const interaction = cassette.interactions[0]
+    if (interaction?.request.storage !== 'metadata') throw new Error('expected metadata fixture')
+    const forged = {
+      ...cassette,
+      interactions: [{
+        ...interaction,
+        request: {
+          storage: 'metadata',
+          metadata: {
+            ...interaction.request.metadata,
+            privatePrompt: 'STORED_PRIVATE_PROMPT',
+            toolFilter: { allow: ['read'], privatePrompt: 'NESTED_PRIVATE_PROMPT' },
+          },
+        },
+      }],
+    } as unknown as CassetteFile
+    const live = {
+      ...withPrompt('different', fakeAgent('live'), 'changed'),
+      toolFilter: { allow: ['write'] },
+    } as unknown as ResolvedSubagentStartRequest
+
+    const diagnostic = new InteractionMatcher(forged, 'reject', false).diagnose(live)
+    const serialized = JSON.stringify(diagnostic)
+    expect(serialized).not.toContain('STORED_PRIVATE_PROMPT')
+    expect(serialized).not.toContain('NESTED_PRIVATE_PROMPT')
+    expect(diagnostic.actual.requestMetadata.toolFilter).toEqual({ allow: ['write'] })
+    if (diagnostic.status !== 'mismatch') throw new Error('expected mismatch diagnostic')
+    expect(diagnostic.candidates[0]?.requestMetadata.toolFilter).toEqual({ allow: ['read'] })
+  })
 
   it('keeps the existing ErrorOptions second argument compatible', () => {
     const cause = new Error('root cause')

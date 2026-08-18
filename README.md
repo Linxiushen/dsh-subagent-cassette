@@ -127,9 +127,11 @@ pnpm exec dsh-cassette inspect .dsh-cassettes/repository-audit.cassette.jsonl --
 pnpm exec dsh-cassette diff baseline.cassette.jsonl candidate.cassette.jsonl --json
 ```
 
-`inspect` prints metadata, call keys, fingerprints, outcome kinds, stop reasons, and durations. It never prints stored prompts or result bodies. Labels can appear inside metadata and readable call keys, so CLI output is not necessarily anonymous.
+`inspect` prints metadata, call keys, fingerprints, outcome kinds, stop-reason categories, and durations. Stop reasons are bounded to `completed`, `aborted`, `error`, `max-tokens`, `refusal`, or `other`; an unknown future DSH value is reported only as `other`. Human output escapes control, format, and line-separator characters from cassette-derived text, and JSON output encodes them with valid JSON escapes. It never prints stored prompts, result bodies, or the raw unknown stop-reason value. Labels can appear inside metadata and readable call keys, so CLI output is not necessarily anonymous.
 
 `diff` aligns only the exact stable identity `(parent key, parent-context fingerprint, request fingerprint, occurrence)`. It reports added, removed, outcome-changed, and boundary-changed calls plus recording-policy drift. Timing deltas are informational and do not affect equivalence. Exit code `0` means equivalent, `2` means different or not safely comparable, and `1` means usage, read, or format failure. Ambiguous duplicate groups and changed parent-context inheritance semantics fail closed instead of being guessed into alignment.
+
+Cassette loading also fails closed at the persisted request boundary. Each metadata or full request view accepts only its documented fields, and every interaction's `request.storage` must match the header's `requestStorage` policy. These checks apply before replay, inspect, diff, or append. This hardening does not change cassette format version `1` or the exact DSH `0.1.0-rc.7` target.
 
 ### 3. Replay offline
 
@@ -159,12 +161,12 @@ Replay loads and verifies the complete available file before registering the pro
 | `provider` | both | `cassette` | Name registered in `ctx.subagents`. |
 | `file` | both | timestamped path | Cassette JSONL path. Replay should always set a fixed path. |
 | `redactSecrets` | record | `true` | Enable built-in key and string redaction while recording. Stored in the header and checked for append compatibility; replay uses the recorded file and ignores this setting. |
-| `redactionPatterns` | record | `[]` | Extra JavaScript regular-expression sources, compiled globally and case-insensitively. Replay does not re-redact loaded data. |
+| `redactionPatterns` | record | `[]` | Extra JavaScript regular-expression sources, compiled globally and case-insensitively. A pattern matching a content-block `type` or image `mediaType` rejects recording because those fields are structural. Replay does not re-redact loaded data. |
 | `upstreamProvider` | record | `spawn` | Real provider to delegate to. Must differ from `provider`. |
 | `writeMode` | record | `create` | `create` refuses an existing file; `truncate` replaces it; `append` verifies and extends a compatible file. Every mode fails fast when another cassette writer holds the target lock. |
 | `requestStorage` | record | `metadata` | `metadata` omits prompt content; `full` persists the normalized request after redaction. |
 | `timing` | replay | `instant` | `instant` returns without recorded delays; `recorded` reproduces recorded boundary delays. |
-| `speed` | replay | `1` | Positive finite multiplier for `recorded` timing; `2` is twice as fast. |
+| `speed` | replay | `1` | Finite multiplier of at least `0.001` for `recorded` timing; `2` is twice as fast. Scaled delays must remain finite. |
 | `duplicatePolicy` | replay | `reject` | Reject differing outcomes for identical parent-context/request groups, or use explicit `sequence` occurrence matching. |
 | `allowRedactedReplay` | replay | `false` | Permit replaying successful results containing redaction substitutions. |
 | `assertConsumed` | replay | `true` | Throw during disposal if recorded interactions remain unmatched. |
@@ -217,11 +219,11 @@ Recorded failures preserve the recorded name, message, and optional string code,
 - `parent-and-request-changed`
 - `parent-not-found`
 
-When `match()` fails, the same object is available as `CassetteMismatchError.diagnostic`. Candidates are deterministically ordered by recorded admission sequence and identify whether each call is already consumed. The diagnostic contains call keys, fingerprints, occurrence data, and request metadata only; it never includes stored prompt, result, or error bodies. These candidates explain a failure and are never used for fuzzy matching.
+When `match()` fails, the same object is available as `CassetteMismatchError.diagnostic`. Candidates are deterministically ordered by recorded admission sequence and identify whether each call is already consumed. Failed normalization, parent fingerprinting, or exact matching does not reserve a new root or occurrence, so a corrected call can retry without poisoned topology state. The matcher constructs candidate metadata from an explicit field allowlist instead of returning a stored metadata object, so forged or future extra fields cannot leak through this path. The diagnostic contains call keys, fingerprints, occurrence data, and approved request metadata only; it never includes stored prompt, result, or error bodies. These candidates explain a failure and are never used for fuzzy matching.
 
 ## Integrity model
 
-Each JSONL record includes a canonical SHA-256 hash, and every interaction names the preceding physical record hash. Verification can detect malformed JSON, unsupported schema/target versions, changed content, middle-record deletion, reordering, duplicate sequence numbers, call keys or occurrences, many partial writes, and a broken available chain.
+Each JSONL record includes a canonical SHA-256 hash, and every interaction names the preceding physical record hash. Verification can detect malformed JSON, duplicate object members, non-lossless numeric values, unsupported schema/target versions, changed content, middle-record deletion, reordering, duplicate sequence numbers, call keys or occurrences, many partial writes, and a broken available chain.
 
 It cannot authenticate the file, stop a malicious editor from recomputing hashes, or detect removal of a complete valid suffix when no external expected tail hash/count exists. Keep cassettes in normal source-control or artifact-store integrity controls. See [Format](docs/format.md#integrity-and-validation) for exact guarantees.
 

@@ -21,6 +21,8 @@ import type {
   DuplicatePolicy,
   JsonValue,
   NormalizedSubagentRequest,
+  NormalizedToolFilter,
+  RequestMetadata,
 } from './types.ts'
 
 function readableLabel(label: string | undefined): string {
@@ -91,19 +93,22 @@ export class TopologyTracker {
     return 'root'
   }
 
-  reserve(request: ResolvedSubagentStartRequest): ReservedCall {
-    const parentKey = this.parentKey(request.parent)
+  reserve(
+    request: ResolvedSubagentStartRequest,
+    normalized: NormalizedSubagentRequest = normalizeRequest(request),
+  ): ReservedCall {
+    const parentKey = this.peekParentKey(request.parent)
     const parentContextFingerprint = fingerprintParentContext(
       normalizeParentContext(request.parent, this.inheritsParentContext),
     )
-    const normalized = normalizeRequest(request)
     const requestFingerprint = fingerprintRequest(normalized)
     const group = interactionGroup(parentKey, parentContextFingerprint, requestFingerprint)
     const occurrence = (this.occurrences.get(group) ?? 0) + 1
-    this.occurrences.set(group, occurrence)
     const identityFingerprint = fingerprintJson({ parentContextFingerprint, requestFingerprint })
     const hash = identityFingerprint.slice('sha256:'.length, 'sha256:'.length + 12)
     const callKey = `${parentKey}/${readableLabel(normalized.label)}-${hash}~${occurrence}`
+    this.parentKey(request.parent)
+    this.occurrences.set(group, occurrence)
     return {
       parentKey,
       callKey,
@@ -132,6 +137,32 @@ function interactionGroup(
   requestFingerprint: string,
 ): string {
   return `${parentKey}\0${parentContextFingerprint}\0${requestFingerprint}`
+}
+
+function projectToolFilter(value: unknown): NormalizedToolFilter | undefined {
+  if (value === undefined || value === null || Array.isArray(value) || typeof value !== 'object') return
+  const filter = value as Record<string, unknown>
+  const allow = filter['allow']
+  const deny = filter['deny']
+  return {
+    ...(Array.isArray(allow) && allow.every(name => typeof name === 'string') ? { allow: [...allow] } : {}),
+    ...(Array.isArray(deny) && deny.every(name => typeof name === 'string') ? { deny: [...deny] } : {}),
+  }
+}
+
+function projectRequestMetadata(metadata: RequestMetadata): RequestMetadata {
+  const toolFilter = projectToolFilter(metadata.toolFilter)
+  return {
+    ...(metadata.label === undefined ? {} : { label: metadata.label }),
+    promptBlocks: metadata.promptBlocks,
+    promptBytes: metadata.promptBytes,
+    hasOutputSchema: metadata.hasOutputSchema,
+    ...(metadata.maxDepth === undefined ? {} : { maxDepth: metadata.maxDepth }),
+    ...(metadata.childProvider === undefined ? {} : { childProvider: metadata.childProvider }),
+    ...(metadata.childModel === undefined ? {} : { childModel: metadata.childModel }),
+    ...(toolFilter === undefined ? {} : { toolFilter }),
+    hasPersona: metadata.hasPersona,
+  }
 }
 
 /** Strict request matcher whose sibling selection is independent of completion order. */
@@ -183,18 +214,21 @@ export class InteractionMatcher {
 
   match(request: ResolvedSubagentStartRequest): CassetteInteraction {
     const normalized = normalizeRequest(request)
-    const parentKey = this.topology.parentKey(request.parent)
+    const parentKey = this.topology.peekParentKey(request.parent)
     const actual = this.describeActual(request, parentKey, normalized)
     const key = interactionGroup(
       actual.parentKey,
       actual.parentContextFingerprint,
       actual.requestFingerprint,
     )
-    const interaction = this.groups.get(key)?.shift()
+    const group = this.groups.get(key)
+    const interaction = group?.[0]
     if (interaction === undefined) {
       const diagnostic = this.mismatchDiagnostic(actual)
       throw new CassetteMismatchError(this.mismatchMessage(diagnostic), { diagnostic })
     }
+    this.topology.parentKey(request.parent)
+    group?.shift()
     this.consumed.add(interaction.callKey)
     return interaction
   }
@@ -250,14 +284,14 @@ export class InteractionMatcher {
         normalizeParentContext(request.parent, this.cassette.header.provider.inheritsParentContext),
       ),
       requestFingerprint: fingerprintRequest(normalized),
-      requestMetadata: requestMetadata(normalized),
+      requestMetadata: projectRequestMetadata(requestMetadata(normalized)),
     }
   }
 
   private diagnosticCandidate(interaction: CassetteInteraction): CassetteDiagnosticCandidate {
     const metadata = interaction.request.storage === 'metadata'
-      ? interaction.request.metadata
-      : requestMetadata(interaction.request.value)
+      ? projectRequestMetadata(interaction.request.metadata)
+      : projectRequestMetadata(requestMetadata(interaction.request.value))
     return {
       sequence: interaction.sequence,
       callKey: interaction.callKey,

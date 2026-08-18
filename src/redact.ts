@@ -43,6 +43,19 @@ export interface RedactionResult<T> {
   readonly count: number
 }
 
+export interface RedactionOptions {
+  readonly preserveString?: (
+    parent: JsonValue[] | Record<string, JsonValue> | undefined,
+    key: string | undefined,
+    value: string,
+  ) => boolean
+  readonly onPreservedStringMatch?: (
+    parent: JsonValue[] | Record<string, JsonValue> | undefined,
+    key: string | undefined,
+    value: string,
+  ) => void
+}
+
 function compilePatterns(enabled: boolean, patterns: readonly string[]): RedactionPattern[] {
   if (!enabled) return []
   const compiled = [...BUILTIN_PATTERNS]
@@ -61,6 +74,7 @@ export function redactJson<T extends JsonValue>(
   input: T,
   enabled = true,
   customPatterns: readonly string[] = [],
+  options: RedactionOptions = {},
 ): RedactionResult<T> {
   const patterns = compilePatterns(enabled, customPatterns)
   let count = 0
@@ -86,6 +100,7 @@ export function redactJson<T extends JsonValue>(
   interface Task {
     readonly value: JsonValue
     readonly key?: string
+    readonly parent?: JsonValue[] | Record<string, JsonValue>
     readonly destination: Destination
   }
 
@@ -107,14 +122,23 @@ export function redactJson<T extends JsonValue>(
 
   const tasks: Task[] = [{ value: input, destination: { kind: 'root' } }]
   for (let task = tasks.pop(); task !== undefined; task = tasks.pop()) {
-    const { value, key, destination } = task
+    const { value, key, parent, destination } = task
     if (key !== undefined && enabled && isSecretKey(key)) {
       count++
       assign(destination, REDACTED)
       continue
     }
     if (typeof value === 'string') {
-      assign(destination, redactString(value))
+      if (options.preserveString?.(parent, key, value) === true) {
+        const previousCount = count
+        redactString(value)
+        const matched = count !== previousCount
+        count = previousCount
+        if (matched) options.onPreservedStringMatch?.(parent, key, value)
+        assign(destination, value)
+      } else {
+        assign(destination, redactString(value))
+      }
       continue
     }
     if (value === null || typeof value !== 'object') {
@@ -127,7 +151,11 @@ export function redactJson<T extends JsonValue>(
       for (let index = value.length - 1; index >= 0; index--) {
         const child = value[index]
         if (child === undefined) throw new TypeError(`redaction input array index ${index} is undefined`)
-        tasks.push({ value: child, destination: { kind: 'array', target: result, index } })
+        tasks.push({
+          value: child,
+          parent: value,
+          destination: { kind: 'array', target: result, index },
+        })
       }
       continue
     }
@@ -141,6 +169,7 @@ export function redactJson<T extends JsonValue>(
       tasks.push({
         value: child,
         key: childKey,
+        parent: value,
         destination: { kind: 'object', target: result, key: childKey },
       })
     }

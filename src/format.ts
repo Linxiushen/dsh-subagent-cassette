@@ -14,6 +14,7 @@ import {
   type CassetteInteraction,
   type CassetteInteractionBody,
   type CassetteSummary,
+  type CassetteStopReasonCategory,
   type CassetteWriteMode,
   type JsonValue,
 } from './types.ts'
@@ -46,8 +47,110 @@ function assertPositiveInteger(value: unknown, path: string): asserts value is n
   }
 }
 
+function assertNonNegativeInteger(value: unknown, path: string): asserts value is number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new CassetteFormatError(`${path} must be a non-negative safe integer`)
+  }
+}
+
+function assertKnownFields(value: Record<string, unknown>, fields: readonly string[], path: string): void {
+  const known = new Set(fields)
+  const extra = Object.keys(value).find(field => !known.has(field))
+  if (extra !== undefined) throw new CassetteFormatError(`${path}.${extra} is not supported`)
+}
+
+type JsonScanContext =
+  | {
+    readonly kind: 'object'
+    readonly keys: Set<string>
+    state: 'key-or-end' | 'colon' | 'value' | 'comma-or-end'
+  }
+  | {
+    readonly kind: 'array'
+    state: 'value-or-end' | 'comma-or-end'
+  }
+
+function assertNoDuplicateJsonMembers(text: string, line: number): void {
+  const stack: JsonScanContext[] = []
+  const completeValue = (): void => {
+    const parent = stack.at(-1)
+    if (parent !== undefined) parent.state = 'comma-or-end'
+  }
+
+  for (let index = 0; index < text.length;) {
+    const character = text[index]
+    if (character === ' ' || character === '\t' || character === '\r' || character === '\n') {
+      index++
+      continue
+    }
+    if (character === '{') {
+      stack.push({ kind: 'object', keys: new Set(), state: 'key-or-end' })
+      index++
+      continue
+    }
+    if (character === '[') {
+      stack.push({ kind: 'array', state: 'value-or-end' })
+      index++
+      continue
+    }
+    if (character === '}' || character === ']') {
+      stack.pop()
+      completeValue()
+      index++
+      continue
+    }
+    if (character === ':') {
+      const context = stack.at(-1)
+      if (context?.kind === 'object') context.state = 'value'
+      index++
+      continue
+    }
+    if (character === ',') {
+      const context = stack.at(-1)
+      if (context?.kind === 'object') context.state = 'key-or-end'
+      else if (context?.kind === 'array') context.state = 'value-or-end'
+      index++
+      continue
+    }
+    if (character === '"') {
+      let end = index + 1
+      while (end < text.length) {
+        if (text[end] === '\\') {
+          end += 2
+          continue
+        }
+        if (text[end] === '"') break
+        end++
+      }
+      const context = stack.at(-1)
+      if (context?.kind === 'object' && context.state === 'key-or-end') {
+        const key = JSON.parse(text.slice(index, end + 1)) as string
+        if (context.keys.has(key)) {
+          throw new CassetteFormatError(`line ${line} contains a duplicate JSON object member`)
+        }
+        context.keys.add(key)
+        context.state = 'colon'
+      } else {
+        completeValue()
+      }
+      index = end + 1
+      continue
+    }
+
+    let end = index + 1
+    while (end < text.length && !/[\s,\]}]/.test(text[end] ?? '')) end++
+    completeValue()
+    index = end
+  }
+
+}
+
 function hashRecord(value: Record<string, unknown>): string {
-  return fingerprintJson(value as JsonValue)
+  try {
+    return fingerprintJson(value as JsonValue)
+  } catch (error: unknown) {
+    throw new CassetteFormatError('cassette record is not lossless canonical JSON', { cause: error })
+  }
 }
 
 function headerWithoutHash(header: CassetteHeader): CassetteHeaderBody {
@@ -62,6 +165,7 @@ function interactionWithoutHash(interaction: CassetteInteraction): CassetteInter
 
 function validateCapabilities(value: unknown, path: string): void {
   if (!isRecord(value)) throw new CassetteFormatError(`${path} must be an object`)
+  assertKnownFields(value, ['outputSchema', 'depthLimit', 'toolFilter', 'persona'], path)
   for (const key of ['outputSchema', 'depthLimit', 'toolFilter', 'persona']) {
     if (typeof value[key] !== 'boolean') throw new CassetteFormatError(`${path}.${key} must be a boolean`)
   }
@@ -70,6 +174,19 @@ function validateCapabilities(value: unknown, path: string): void {
 function validateHeader(value: unknown): CassetteHeader {
   if (!isRecord(value)) throw new CassetteFormatError('line 1 must be a cassette header object')
   if (value['kind'] !== 'cassette/header') throw new CassetteFormatError('line 1 is not a cassette header')
+  assertKnownFields(value, [
+    'kind',
+    'format',
+    'version',
+    'cassetteId',
+    'createdAt',
+    'target',
+    'provider',
+    'requestStorage',
+    'redactSecrets',
+    'redactionPatterns',
+    'hash',
+  ], 'header')
   if (value['format'] !== CASSETTE_FORMAT) {
     throw new CassetteFormatError(`unsupported cassette format "${String(value['format'])}"`)
   }
@@ -88,8 +205,10 @@ function validateHeader(value: unknown): CassetteHeader {
       + `expected ${TARGET_DSH_SUBAGENT_VERSION}`,
     )
   }
+  assertKnownFields(target, ['dshSubagent'], 'header.target')
   const provider = value['provider']
   if (!isRecord(provider)) throw new CassetteFormatError('header.provider must be an object')
+  assertKnownFields(provider, ['cassette', 'upstream', 'capabilities', 'inheritsParentContext'], 'header.provider')
   assertString(provider['cassette'], 'header.provider.cassette')
   assertString(provider['upstream'], 'header.provider.upstream')
   validateCapabilities(provider['capabilities'], 'header.provider.capabilities')
@@ -115,6 +234,7 @@ function validateHeader(value: unknown): CassetteHeader {
 
 function validateRecordedError(value: unknown, path: string): void {
   if (!isRecord(value)) throw new CassetteFormatError(`${path} must be an object`)
+  assertKnownFields(value, ['name', 'message', 'code'], path)
   assertString(value['name'], `${path}.name`)
   if (typeof value['message'] !== 'string') throw new CassetteFormatError(`${path}.message must be a string`)
   if (value['code'] !== undefined && typeof value['code'] !== 'string') {
@@ -122,32 +242,180 @@ function validateRecordedError(value: unknown, path: string): void {
   }
 }
 
+function validateContentBlocks(value: unknown, path: string): void {
+  if (!Array.isArray(value)) throw new CassetteFormatError(`${path} must be an array`)
+  const pending: Array<{ readonly blocks: unknown[]; readonly depth: number }> = [{ blocks: value, depth: 0 }]
+  for (let task = pending.pop(); task !== undefined; task = pending.pop()) {
+    for (const [index, block] of task.blocks.entries()) {
+      const blockPath = task.depth === 0
+        ? `${path}[${index}]`
+        : `${path} nested content at depth ${task.depth}, index ${index}`
+      if (!isRecord(block) || typeof block['type'] !== 'string' || block['type'].length === 0) {
+        throw new CassetteFormatError(`${blockPath} must be a typed content block`)
+      }
+      switch (block['type']) {
+        case 'text':
+        case 'reasoning':
+          if (typeof block['text'] !== 'string') {
+            throw new CassetteFormatError(`${blockPath}.text must be a string`)
+          }
+          break
+        case 'image': {
+          const attachment = block['attachment']
+          if (!isRecord(attachment)) {
+            throw new CassetteFormatError(`${blockPath}.attachment must be an object`)
+          }
+          assertString(attachment['attachmentId'], `${blockPath}.attachment.attachmentId`)
+          if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(String(attachment['mediaType']))) {
+            throw new CassetteFormatError(`${blockPath}.attachment.mediaType is unsupported`)
+          }
+          assertNonNegativeInteger(attachment['bytes'], `${blockPath}.attachment.bytes`)
+          assertPositiveInteger(attachment['width'], `${blockPath}.attachment.width`)
+          assertPositiveInteger(attachment['height'], `${blockPath}.attachment.height`)
+          if (attachment['name'] !== undefined && typeof attachment['name'] !== 'string') {
+            throw new CassetteFormatError(`${blockPath}.attachment.name must be a string when present`)
+          }
+          break
+        }
+        case 'tool-call':
+          for (const field of ['id', 'name', 'arguments']) {
+            if (typeof block[field] !== 'string') {
+              throw new CassetteFormatError(`${blockPath}.${field} must be a string`)
+            }
+          }
+          break
+        case 'tool-result': {
+          if (typeof block['toolCallId'] !== 'string') {
+            throw new CassetteFormatError(`${blockPath}.toolCallId must be a string`)
+          }
+          if (!Array.isArray(block['content'])) {
+            throw new CassetteFormatError(`${blockPath}.content must be an array`)
+          }
+          if (block['isError'] !== undefined && typeof block['isError'] !== 'boolean') {
+            throw new CassetteFormatError(`${blockPath}.isError must be a boolean when present`)
+          }
+          pending.push({ blocks: block['content'], depth: task.depth + 1 })
+          break
+        }
+      }
+    }
+  }
+}
+
 function validateOutcome(value: unknown, path: string): void {
   if (!isRecord(value)) throw new CassetteFormatError(`${path} must be an object`)
   if (value['kind'] === 'start-error' || value['kind'] === 'result-error') {
+    assertKnownFields(value, ['kind', 'error'], path)
     validateRecordedError(value['error'], `${path}.error`)
     return
   }
   if (value['kind'] !== 'result') throw new CassetteFormatError(`${path}.kind is unsupported`)
-  assertNonNegative(value['redactions'], `${path}.redactions`)
+  assertKnownFields(value, ['kind', 'result', 'redactions'], path)
+  assertNonNegativeInteger(value['redactions'], `${path}.redactions`)
   const result = value['result']
   if (!isRecord(result) || !Array.isArray(result['output']) || typeof result['stopReason'] !== 'string') {
     throw new CassetteFormatError(`${path}.result must contain output[] and stopReason`)
+  }
+  validateContentBlocks(result['output'], `${path}.result.output`)
+}
+
+function validateToolFilter(value: unknown, path: string): void {
+  if (!isRecord(value)) throw new CassetteFormatError(`${path} must be an object`)
+  assertKnownFields(value, ['allow', 'deny'], path)
+  for (const field of ['allow', 'deny']) {
+    const names = value[field]
+    if (names !== undefined && (!Array.isArray(names) || names.some(name => typeof name !== 'string'))) {
+      throw new CassetteFormatError(`${path}.${field} must be an array of strings when present`)
+    }
+  }
+}
+
+function validateRequestMetadata(value: unknown, path: string): void {
+  if (!isRecord(value)) throw new CassetteFormatError(`${path} must be an object`)
+  assertKnownFields(value, [
+    'label',
+    'promptBlocks',
+    'promptBytes',
+    'hasOutputSchema',
+    'maxDepth',
+    'childProvider',
+    'childModel',
+    'toolFilter',
+    'hasPersona',
+  ], path)
+  if (value['label'] !== undefined && typeof value['label'] !== 'string') {
+    throw new CassetteFormatError(`${path}.label must be a string when present`)
+  }
+  assertNonNegativeInteger(value['promptBlocks'], `${path}.promptBlocks`)
+  assertNonNegativeInteger(value['promptBytes'], `${path}.promptBytes`)
+  if (typeof value['hasOutputSchema'] !== 'boolean' || typeof value['hasPersona'] !== 'boolean') {
+    throw new CassetteFormatError(`${path}.hasOutputSchema and ${path}.hasPersona must be booleans`)
+  }
+  if (value['maxDepth'] !== undefined) assertNonNegativeInteger(value['maxDepth'], `${path}.maxDepth`)
+  for (const field of ['childProvider', 'childModel']) {
+    if (value[field] !== undefined && typeof value[field] !== 'string') {
+      throw new CassetteFormatError(`${path}.${field} must be a string when present`)
+    }
+  }
+  if (value['toolFilter'] !== undefined) validateToolFilter(value['toolFilter'], `${path}.toolFilter`)
+}
+
+function validateFullRequest(value: unknown, path: string): void {
+  if (!isRecord(value)) throw new CassetteFormatError(`${path} must be an object`)
+  assertKnownFields(value, [
+    'label',
+    'prompt',
+    'agentOptions',
+    'outputSchema',
+    'maxDepth',
+    'toolFilter',
+    'persona',
+  ], path)
+  validateContentBlocks(value['prompt'], `${path}.prompt`)
+  if (value['label'] !== undefined && typeof value['label'] !== 'string') {
+    throw new CassetteFormatError(`${path}.label must be a string when present`)
+  }
+  if (value['agentOptions'] !== undefined && !isRecord(value['agentOptions'])) {
+    throw new CassetteFormatError(`${path}.agentOptions must be an object when present`)
+  }
+  if (value['outputSchema'] !== undefined && !isRecord(value['outputSchema'])) {
+    throw new CassetteFormatError(`${path}.outputSchema must be an object when present`)
+  }
+  if (value['maxDepth'] !== undefined) assertNonNegativeInteger(value['maxDepth'], `${path}.maxDepth`)
+  if (value['toolFilter'] !== undefined) validateToolFilter(value['toolFilter'], `${path}.toolFilter`)
+  if (value['persona'] !== undefined && typeof value['persona'] !== 'string') {
+    throw new CassetteFormatError(`${path}.persona must be a string when present`)
   }
 }
 
 function validateStoredRequest(value: unknown, path: string): void {
   if (!isRecord(value)) throw new CassetteFormatError(`${path} must be an object`)
   if (value['storage'] === 'metadata') {
-    if (!isRecord(value['metadata'])) throw new CassetteFormatError(`${path}.metadata must be an object`)
+    assertKnownFields(value, ['storage', 'metadata'], path)
+    validateRequestMetadata(value['metadata'], `${path}.metadata`)
     return
   }
   if (value['storage'] === 'full') {
-    if (!isRecord(value['value'])) throw new CassetteFormatError(`${path}.value must be an object`)
-    assertNonNegative(value['redactions'], `${path}.redactions`)
+    assertKnownFields(value, ['storage', 'value', 'redactions'], path)
+    validateFullRequest(value['value'], `${path}.value`)
+    assertNonNegativeInteger(value['redactions'], `${path}.redactions`)
     return
   }
   throw new CassetteFormatError(`${path}.storage must be "metadata" or "full"`)
+}
+
+/** Project an extensible DSH stop reason into a bounded metadata-safe category. */
+export function classifyStopReason(value: string): CassetteStopReasonCategory {
+  switch (value) {
+    case 'completed':
+    case 'aborted':
+    case 'error':
+    case 'max-tokens':
+    case 'refusal':
+      return value
+    default:
+      return 'other'
+  }
 }
 
 function validateInteraction(value: unknown, line: number, expectedPreviousHash: string): CassetteInteraction {
@@ -155,6 +423,22 @@ function validateInteraction(value: unknown, line: number, expectedPreviousHash:
   if (!isRecord(value) || value['kind'] !== 'cassette/interaction') {
     throw new CassetteFormatError(`${path} is not a cassette interaction`)
   }
+  assertKnownFields(value, [
+    'kind',
+    'sequence',
+    'callKey',
+    'parentKey',
+    'parentContextFingerprint',
+    'occurrence',
+    'requestFingerprint',
+    'request',
+    'timing',
+    'published',
+    'local',
+    'outcome',
+    'previousHash',
+    'hash',
+  ], path)
   assertPositiveInteger(value['sequence'], `${path}.sequence`)
   assertString(value['callKey'], `${path}.callKey`)
   assertString(value['parentKey'], `${path}.parentKey`)
@@ -164,6 +448,13 @@ function validateInteraction(value: unknown, line: number, expectedPreviousHash:
   validateStoredRequest(value['request'], `${path}.request`)
   const timing = value['timing']
   if (!isRecord(timing)) throw new CassetteFormatError(`${path}.timing must be an object`)
+  assertKnownFields(timing, [
+    'startedAt',
+    'startLatencyMs',
+    'durationMs',
+    'signalAbortedAtMs',
+    'disposeCalledAtMs',
+  ], `${path}.timing`)
   assertString(timing['startedAt'], `${path}.timing.startedAt`)
   assertNonNegative(timing['startLatencyMs'], `${path}.timing.startLatencyMs`)
   assertNonNegative(timing['durationMs'], `${path}.timing.durationMs`)
@@ -207,8 +498,11 @@ export function parseCassette(text: string, source?: string): CassetteFile {
   if (lines.length === 0) throw new CassetteFormatError('cassette is empty')
   const parseLine = (line: string, index: number): unknown => {
     try {
-      return JSON.parse(line)
+      const parsed: unknown = JSON.parse(line)
+      assertNoDuplicateJsonMembers(line, index + 1)
+      return parsed
     } catch (error: unknown) {
+      if (error instanceof CassetteFormatError) throw error
       throw new CassetteFormatError(`line ${index + 1} is not valid JSON`, { cause: error })
     }
   }
@@ -224,6 +518,11 @@ export function parseCassette(text: string, source?: string): CassetteFile {
     const line = lines[index]
     if (line === undefined) continue
     const interaction = validateInteraction(parseLine(line, index), index + 1, previousHash)
+    if (interaction.request.storage !== header.requestStorage) {
+      throw new CassetteFormatError(
+        `line ${index + 1}.request.storage must match header.requestStorage "${header.requestStorage}"`,
+      )
+    }
     if (sequences.has(interaction.sequence)) {
       throw new CassetteFormatError(`line ${index + 1} duplicates sequence ${interaction.sequence}`)
     }
@@ -309,7 +608,17 @@ export function summarizeCassette(cassette: CassetteFile): CassetteSummary {
   return {
     ...(cassette.source === undefined ? {} : { file: cassette.source }),
     cassetteId: cassette.header.cassetteId,
-    provider: cassette.header.provider,
+    provider: {
+      cassette: cassette.header.provider.cassette,
+      upstream: cassette.header.provider.upstream,
+      capabilities: {
+        outputSchema: cassette.header.provider.capabilities.outputSchema,
+        depthLimit: cassette.header.provider.capabilities.depthLimit,
+        toolFilter: cassette.header.provider.capabilities.toolFilter,
+        persona: cassette.header.provider.capabilities.persona,
+      },
+      inheritsParentContext: cassette.header.provider.inheritsParentContext,
+    },
     interactions: cassette.interactions.length,
     completed,
     failed,
@@ -349,7 +658,9 @@ export function createHeader(options: CreateHeaderOptions): CassetteHeader {
     redactSecrets: options.redactSecrets,
     redactionPatterns: [...(options.redactionPatterns ?? [])],
   }
-  return { ...body, hash: hashRecord(body as unknown as Record<string, unknown>) }
+  const header = { ...body, hash: hashRecord(body as unknown as Record<string, unknown>) }
+  validateHeader(header)
+  return header
 }
 
 function assertAppendCompatible(actual: CassetteHeader, requested: CassetteHeader): void {
@@ -507,6 +818,7 @@ export class CassetteWriter {
   }
 
   static async open(path: string, requestedHeader: CassetteHeader, mode: CassetteWriteMode): Promise<CassetteWriter> {
+    validateHeader(requestedHeader)
     const absolute = resolve(path)
     await mkdir(dirname(absolute), { recursive: true })
     const lock = await acquireWriterLock(absolute)
@@ -583,6 +895,12 @@ export class CassetteWriter {
       const interaction: CassetteInteraction = {
         ...unhashed,
         hash: hashRecord(unhashed as unknown as Record<string, unknown>),
+      }
+      validateInteraction(interaction, body.sequence + 1, this.previousHash)
+      if (interaction.request.storage !== this.header.requestStorage) {
+        throw new CassetteFormatError(
+          `interaction request.storage must match header.requestStorage "${this.header.requestStorage}"`,
+        )
       }
       await this.handle.write(`${canonicalStringify(interaction as unknown as JsonValue)}\n`)
       this.previousHash = interaction.hash

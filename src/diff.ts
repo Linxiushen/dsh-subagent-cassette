@@ -1,9 +1,10 @@
 import { canonicalStringify, fingerprintJson } from './canonical.ts'
-import { ambiguousGroups } from './format.ts'
+import { ambiguousGroups, classifyStopReason } from './format.ts'
 import type {
   CassetteFile,
   CassetteInteraction,
   CassetteOutcome,
+  CassetteStopReasonCategory,
   JsonValue,
 } from './types.ts'
 
@@ -31,7 +32,7 @@ export interface CassetteCallIdentity {
 export interface CassetteCallSummary extends CassetteCallIdentity {
   readonly callKey: string
   readonly outcomeKind: CassetteOutcome['kind']
-  readonly stopReason?: string
+  readonly stopReason?: CassetteStopReasonCategory
   readonly outcomeFingerprint: string
   readonly published: boolean
   readonly local: boolean
@@ -116,7 +117,7 @@ function summarize(interaction: CassetteInteraction): CassetteCallSummary {
     callKey: interaction.callKey,
     outcomeKind: interaction.outcome.kind,
     ...(interaction.outcome.kind === 'result'
-      ? { stopReason: interaction.outcome.result.stopReason }
+      ? { stopReason: classifyStopReason(interaction.outcome.result.stopReason) }
       : {}),
     outcomeFingerprint: outcomeFingerprint(interaction),
     published: interaction.published,

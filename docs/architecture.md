@@ -38,15 +38,14 @@ The recorder wraps that lifecycle rather than inventing a second run model.
 
 For every admitted `start()` call, the recorder:
 
-1. Maps the live parent to a stable topology key.
-2. Snapshots the observable parent context and computes its canonical fingerprint.
-3. Snapshots and normalizes the request, then computes its canonical request fingerprint.
-4. Reserves a per-group occurrence and a globally unique sequence number.
-5. Builds either the metadata request view or the redacted full request view.
-6. Calls the upstream provider with the original request.
-7. Observes the returned run's result, abort signal, and disposal.
-8. Snapshots and redacts the terminal result or error facts.
-9. Serializes one interaction through the append queue.
+1. Snapshots and normalizes the request, validates the DSH `toolFilter` allow/deny contract, and builds either the metadata request view or the redacted full request view.
+2. Resolves the live parent without committing it as the cassette root.
+3. Snapshots the observable parent context and computes the canonical parent-context and request fingerprints.
+4. Atomically commits the stable root mapping and per-group occurrence after all fallible preprocessing succeeds, then reserves a globally unique sequence number.
+5. Calls the upstream provider with the original request.
+6. Observes the returned run's result, abort signal, and disposal.
+7. Snapshots and redacts the terminal result or error facts.
+8. Serializes one interaction through the append queue.
 
 The original successful result snapshot is returned to the live caller. Redaction affects the persisted copy, not the record-mode caller's value.
 
@@ -91,6 +90,8 @@ The recorder rejects:
 - attempts to map one child id to two call keys.
 
 This makes missing topology information explicit instead of silently falling back to volatile ids.
+
+Root mapping and occurrence reservation are transactional. Request normalization, parent-context fingerprinting, identity construction, and exact replay lookup complete before a new live root or occurrence is committed. A malformed request/context or an exact-match failure therefore cannot poison the tracker for a later valid call from the scenario's real root.
 
 ### Nested-call limit
 
@@ -160,6 +161,8 @@ start delay = startLatencyMs / speed
 result delay = (durationMs - startLatencyMs) / speed
 ```
 
+The replay provider accepts only `instant` or `recorded` timing and a finite `speed >= 0.001`. It validates each scaled delay as non-negative and finite before handing it to the timer loop, so extreme recorded values cannot silently become an infinite wait. Long finite waits are scheduled in bounded timer chunks, each of which remains abortable.
+
 An already-aborted signal, or an abort during start delay, rejects publication. An abort after publication, or explicit run disposal, resolves the result as an aborted `SubagentResult`. These are live replay controls; replay does not force the original recording's abort moment to recur.
 
 ## Consumption assertion
@@ -170,11 +173,17 @@ Set `assertConsumed: false` only when partial replay is intentional. Extra live 
 
 ## Structured mismatch diagnostics
 
+`loadCassette()` validates the persisted boundary before the matcher index is built. Cassette-owned header, target, provider/capability, interaction, timing, request-view, outcome, and recorded-error wrappers have closed field sets, and each interaction's storage arm must agree with the header's `requestStorage` policy. DSH `SubagentResult` data and unknown typed content blocks remain deliberate extension points. Replay, inspect, diff, and append therefore share the same fail-closed boundary without blocking compatible DSH result extensions.
+
+`createHeader()` validates the document it constructs. The writer revalidates a requested header before creating or locking a target and applies the same interaction validator before committing each JSONL record, including result content-block checks. Invalid runtime request filters fail during request normalization before the upstream provider starts; invalid direct `CassetteWriter` input is rejected without writing a header or interaction.
+
+Content-block discovery, validation, and redaction traverse nested `tool-result.content` with explicit worklists. Validation performs linear work per visited block and avoids building depth-sized paths for every node; the regression suite records and reloads a 20,000-level nested result. Schema-aware redaction protects structural `type` discriminators and image `mediaType` values while continuing to redact payload strings. A pattern that would alter either protected field fails recording with `INVALID_CONFIG`, avoiding both silent redaction gaps and structurally unloadable output.
+
 The matcher retains an immutable, admission-sequence-ordered interaction index beside its consumable exact-match queues. `diagnose(request)` computes the same parent key, parent-context fingerprint, and request fingerprint as `match()`, but only peeks at the topology and queue. It neither consumes an interaction nor reserves a previously unseen top-level parent.
 
 The result is a discriminated union with `status: match` or `status: mismatch`. Mismatches classify exact-group exhaustion, parent-context drift, request drift, combined drift, and an unavailable parent topology. `match()` uses the same analysis to populate `CassetteMismatchError.diagnostic`, so human errors and programmatic diagnostics cannot diverge from matching rules.
 
-Candidate selection remains explanatory. It never changes the strict replay key and never supplies a fallback interaction. Candidates are ordered by recorded admission `sequence`, include their consumption state, and expose only request metadata, topology keys, fingerprints, and occurrence information. Stored prompts, results, and recorded error bodies are not projected into diagnostics.
+Candidate selection remains explanatory. It never changes the strict replay key and never supplies a fallback interaction. Candidates are ordered by recorded admission `sequence`, include their consumption state, and expose only request metadata, topology keys, fingerprints, and occurrence information. Metadata candidates are rebuilt through an explicit allowlist rather than exposing stored objects directly, preventing forged or future extra fields from crossing the diagnostic boundary. Stored prompts, results, and recorded error bodies are not projected into diagnostics.
 
 ## Cassette diff
 
@@ -188,7 +197,7 @@ Physical line order, `sequence`, cassette id, creation time, record hashes, time
 
 The comparison also reports provider and persistence-policy drift. Differing `inheritsParentContext` values make the documents not safely comparable because their parent fingerprints have different semantics. Ambiguous duplicate outcome groups also fail closed instead of treating occurrence order as an inferred identity.
 
-The CLI maps an equivalent comparison to exit code `0`, a material difference or non-comparable input to `2`, and usage/read/format errors to `1`. Human and JSON reports contain metadata and fingerprints only, never stored request or outcome bodies.
+The CLI maps an equivalent comparison to exit code `0`, a material difference or non-comparable input to `2`, and usage/read/format errors to `1`. Human and JSON reports contain metadata and fingerprints only, never stored request or outcome bodies. Inspect and diff normalize stop reasons into the public categories `completed`, `aborted`, `error`, `max-tokens`, `refusal`, and `other`; unknown raw strings never cross that reporting boundary. Canonical outcome fingerprinting still uses the exact stored outcome, so two different unknown strings remain detectable as an outcome change without being disclosed. Human output renders Unicode control, format, line-separator, and paragraph-separator characters as visible `\u{...}` escapes; JSON output encodes them only inside string literals and remains valid JSON.
 
 ## Component map
 
@@ -205,6 +214,8 @@ The CLI maps an equivalent comparison to exit code `0`, a material difference or
 | `src/errors.ts` | Stable cassette error classes and codes. |
 
 ## Deliberate extension points
+
+Public TypeScript declarations track the validated runtime shapes: recursive JSON objects are exposed as `JsonObject`, normalized request prompts use DSH `ContentBlock[]`, normalized `agentOptions`/`outputSchema` require objects, results use DSH `SubagentResult`, and tool filters use the allow/deny-only `NormalizedToolFilter`. The DSH-owned `ContentBlock` and `SubagentResult` surfaces retain their documented extension behavior.
 
 - The public `installCassette()` API supports programmatic Cordis composition.
 - `dsh-subagent-cassette/format` exports the parser, writer, and summary APIs for trusted tooling.

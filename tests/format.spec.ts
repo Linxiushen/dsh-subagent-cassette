@@ -2,6 +2,7 @@ import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { fingerprintJson } from '../src/canonical.ts'
+import { CassetteFormatError } from '../src/errors.ts'
 import {
   ambiguousGroups,
   CassetteWriter,
@@ -60,8 +61,11 @@ function interaction(
   }
 }
 
-function signedCassette(interactions: readonly CassetteInteractionBody[]): string {
-  const cassetteHeader = header()
+function signedCassette(
+  interactions: readonly CassetteInteractionBody[],
+  requestStorage: 'metadata' | 'full' = 'metadata',
+): string {
+  const cassetteHeader = header(requestStorage)
   let previousHash = cassetteHeader.hash
   const lines = interactions.map((body) => {
     const unhashed = { ...body, previousHash }
@@ -88,6 +92,25 @@ describe('cassette format', () => {
     const cassette = await loadCassette(temp.path())
     expect(cassette.interactions.map(item => item.sequence)).toEqual([2, 1])
     expect(cassette.interactions[1]?.previousHash).toBe(cassette.interactions[0]?.hash)
+  })
+
+  it('rejects an invalid writer header before creating a cassette', async () => {
+    const temp = await workspace()
+    const invalidHeader = { ...header(), privatePrompt: 'TOP_SECRET' }
+    await expect(CassetteWriter.open(temp.path(), invalidHeader, 'create'))
+      .rejects.toThrow(/header\.privatePrompt is not supported/)
+    await expect(readFile(temp.path(), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('does not construct a header that its own parser rejects', () => {
+    expect(() => createHeader({
+      cassette: '',
+      upstream: 'spawn',
+      capabilities: { outputSchema: true, depthLimit: true, toolFilter: true, persona: true },
+      inheritsParentContext: false,
+      requestStorage: 'metadata',
+      redactSecrets: true,
+    })).toThrow(/header\.provider\.cassette must be a non-empty string/)
   })
 
   it('detects content tampering even when JSON remains valid', async () => {
@@ -121,6 +144,43 @@ describe('cassette format', () => {
       .toThrow(/unsupported cassette format/)
   })
 
+  it('rejects duplicate JSON members, including escaped equivalent keys', () => {
+    const [validHeader, validInteraction] = signedCassette([interaction(1)]).split('\n')
+    if (validHeader === undefined || validInteraction === undefined) throw new Error('fixture missing records')
+    const headerSecret = 'HIDDEN_RAW_HEADER_SECRET'
+    const duplicateHeader = validHeader.replace(
+      '"cassetteId":',
+      `"cassette\\u0049d":"${headerSecret}","cassetteId":`,
+    )
+    let headerMessage = ''
+    try {
+      parseCassette(duplicateHeader)
+    } catch (error: unknown) {
+      headerMessage = error instanceof Error ? error.message : String(error)
+    }
+    expect(headerMessage).toMatch(/duplicate JSON object member/)
+    expect(headerMessage).not.toContain(headerSecret)
+
+    const interactionSecret = 'HIDDEN_RAW_INTERACTION_SECRET'
+    const duplicateInteraction = validInteraction.replace(
+      '"promptBlocks":1',
+      `"promptBlocks":"${interactionSecret}","promptBlocks":1`,
+    )
+    expect(() => parseCassette(`${validHeader}\n${duplicateInteraction}`))
+      .toThrow(/duplicate JSON object member/)
+  })
+
+  it('reports non-lossless canonical numbers as cassette format errors', () => {
+    const [validHeader, validInteraction] = signedCassette([interaction(1)]).split('\n')
+    if (validHeader === undefined || validInteraction === undefined) throw new Error('fixture missing records')
+    const negativeZero = validInteraction
+      .replace('"startLatencyMs":1', '"startLatencyMs":-0')
+      .replace('"durationMs":10', '"durationMs":-0')
+    const document = `${validHeader}\n${negativeZero}`
+    expect(() => parseCassette(document)).toThrow(CassetteFormatError)
+    expect(() => parseCassette(document)).toThrow(/not lossless canonical JSON/)
+  })
+
   it('rejects structurally invalid headers before accepting their hash', () => {
     const [validHeader] = signedCassette([]).split('\n')
     if (validHeader === undefined) throw new Error('fixture missing header')
@@ -133,13 +193,35 @@ describe('cassette format', () => {
       { mutate: value => { value['cassetteId'] = '' }, expected: /cassetteId must be a non-empty string/ },
       { mutate: value => { value['createdAt'] = 'not-a-date' }, expected: /must be an ISO timestamp/ },
       { mutate: value => { value['target'] = null }, expected: /cassette targets/ },
+      {
+        mutate: value => {
+          const target = value['target'] as Record<string, unknown>
+          target['privatePrompt'] = 'TOP_SECRET'
+        },
+        expected: /target\.privatePrompt is not supported/,
+      },
       { mutate: value => { value['provider'] = [] }, expected: /provider must be an object/ },
+      {
+        mutate: value => {
+          const provider = value['provider'] as Record<string, unknown>
+          provider['privatePrompt'] = 'TOP_SECRET'
+        },
+        expected: /provider\.privatePrompt is not supported/,
+      },
       {
         mutate: value => {
           const provider = value['provider'] as Record<string, unknown>
           provider['capabilities'] = { outputSchema: true }
         },
         expected: /capabilities\.depthLimit must be a boolean/,
+      },
+      {
+        mutate: value => {
+          const provider = value['provider'] as Record<string, unknown>
+          const capabilities = provider['capabilities'] as Record<string, unknown>
+          capabilities['privatePrompt'] = 'TOP_SECRET'
+        },
+        expected: /capabilities\.privatePrompt is not supported/,
       },
       {
         mutate: value => {
@@ -153,6 +235,7 @@ describe('cassette format', () => {
       { mutate: value => { value['redactionPatterns'] = ['ok', 42] }, expected: /array of strings/ },
       { mutate: value => { value['hash'] = 'SHA256:bad' }, expected: /lowercase SHA-256 digest/ },
       { mutate: value => { value['cassetteId'] = 'tampered' }, expected: /header hash mismatch/ },
+      { mutate: value => { value['privatePrompt'] = 'TOP_SECRET' }, expected: /privatePrompt is not supported/ },
     ]
     for (const { mutate, expected } of cases) {
       const candidate = JSON.parse(validHeader) as Record<string, unknown>
@@ -175,9 +258,47 @@ describe('cassette format', () => {
       { mutate: value => { delete value['parentContextFingerprint'] }, expected: /parentContextFingerprint/ },
       { mutate: value => { value['requestFingerprint'] = 'sha256:ABC' }, expected: /lowercase SHA-256 digest/ },
       { mutate: value => { value['request'] = { storage: 'metadata' } }, expected: /metadata must be an object/ },
-      { mutate: value => { value['request'] = { storage: 'full', value: {}, redactions: -1 } }, expected: /non-negative/ },
+      {
+        mutate: value => {
+          value['request'] = { storage: 'metadata', metadata: {
+            promptBlocks: 1,
+            promptBytes: 10,
+            hasOutputSchema: false,
+            hasPersona: false,
+            privatePrompt: 'TOP_SECRET',
+          } }
+        },
+        expected: /privatePrompt is not supported/,
+      },
+      {
+        mutate: value => {
+          value['request'] = { storage: 'metadata', metadata: {
+            promptBlocks: 1,
+            promptBytes: 10,
+            hasOutputSchema: false,
+            toolFilter: { allow: ['read'], privatePrompt: 'TOP_SECRET' },
+            hasPersona: false,
+          } }
+        },
+        expected: /toolFilter\.privatePrompt is not supported/,
+      },
+      {
+        mutate: value => { value['request'] = { storage: 'full', value: {}, redactions: 0 } },
+        expected: /value\.prompt must be an array/,
+      },
+      {
+        mutate: value => { value['request'] = { storage: 'full', value: { prompt: [] }, redactions: -1 } },
+        expected: /non-negative safe integer/,
+      },
       { mutate: value => { value['request'] = { storage: 'unknown' } }, expected: /storage must be/ },
       { mutate: value => { value['timing'] = null }, expected: /timing must be an object/ },
+      {
+        mutate: value => {
+          const timing = value['timing'] as Record<string, unknown>
+          timing['privatePrompt'] = 'TOP_SECRET'
+        },
+        expected: /timing\.privatePrompt is not supported/,
+      },
       {
         mutate: value => {
           const timing = value['timing'] as Record<string, unknown>
@@ -196,15 +317,50 @@ describe('cassette format', () => {
       { mutate: value => { value['outcome'] = { kind: 'unknown' } }, expected: /outcome\.kind is unsupported/ },
       {
         mutate: value => {
+          const outcome = value['outcome'] as Record<string, unknown>
+          outcome['privatePrompt'] = 'TOP_SECRET'
+        },
+        expected: /outcome\.privatePrompt is not supported/,
+      },
+      {
+        mutate: value => {
           value['outcome'] = { kind: 'result', redactions: 0, result: { output: 'bad', stopReason: 'completed' } }
         },
         expected: /result must contain output/,
       },
       {
         mutate: value => {
+          value['outcome'] = { kind: 'result', redactions: 0, result: { output: [42], stopReason: 'completed' } }
+        },
+        expected: /result\.output\[0\] must be a typed content block/,
+      },
+      {
+        mutate: value => {
+          value['outcome'] = {
+            kind: 'result',
+            redactions: 0,
+            result: {
+              output: [{ type: 'tool-result', toolCallId: 'call-1', content: [{ type: 'text' }] }],
+              stopReason: 'completed',
+            },
+          }
+        },
+        expected: /nested content at depth 1, index 0\.text must be a string/,
+      },
+      {
+        mutate: value => {
           value['outcome'] = { kind: 'result-error', error: { name: 'Error', message: '', code: 42 } }
         },
         expected: /code must be a string/,
+      },
+      {
+        mutate: value => {
+          value['outcome'] = {
+            kind: 'result-error',
+            error: { name: 'Error', message: '', privatePrompt: 'TOP_SECRET' },
+          }
+        },
+        expected: /error\.privatePrompt is not supported/,
       },
       {
         mutate: value => {
@@ -222,6 +378,7 @@ describe('cassette format', () => {
         },
         expected: /unpublished interaction cannot be local/,
       },
+      { mutate: value => { value['privatePrompt'] = 'TOP_SECRET' }, expected: /privatePrompt is not supported/ },
     ]
     for (const { mutate, expected } of cases) {
       const candidate = JSON.parse(validInteraction) as Record<string, unknown>
@@ -229,6 +386,110 @@ describe('cassette format', () => {
       expect(() => parseCassette(`${validHeader}\n${JSON.stringify(candidate)}`)).toThrow(expected)
     }
   })
+
+  it('requires every interaction request view to match the header storage policy', () => {
+    const fullRequest: CassetteInteractionBody = {
+      ...interaction(1),
+      request: { storage: 'full', value: { prompt: [] }, redactions: 0 },
+    }
+    expect(() => parseCassette(signedCassette([fullRequest])))
+      .toThrow(/request\.storage must match header\.requestStorage "metadata"/)
+    expect(() => parseCassette(signedCassette([interaction(1)], 'full')))
+      .toThrow(/request\.storage must match header\.requestStorage "full"/)
+  })
+
+  it('rejects hash-valid forged request views before they reach diagnostics', () => {
+    const metadataSecret = 'TOP_SECRET_METADATA_VALUE'
+    const forgedMetadata = {
+      ...interaction(1),
+      request: {
+        storage: 'metadata',
+        metadata: {
+          promptBlocks: 1,
+          promptBytes: 10,
+          hasOutputSchema: false,
+          hasPersona: false,
+          privatePrompt: metadataSecret,
+        },
+      },
+    } as unknown as CassetteInteractionBody
+    let metadataMessage = ''
+    try {
+      parseCassette(signedCassette([forgedMetadata]))
+    } catch (error: unknown) {
+      metadataMessage = error instanceof Error ? error.message : String(error)
+    }
+    expect(metadataMessage).toMatch(/privatePrompt is not supported/)
+    expect(metadataMessage).not.toContain(metadataSecret)
+
+    const emptyFullRequest = {
+      ...interaction(1),
+      request: { storage: 'full', value: {}, redactions: 0 },
+    } as unknown as CassetteInteractionBody
+    expect(() => parseCassette(signedCassette([emptyFullRequest], 'full')))
+      .toThrow(/value\.prompt must be an array/)
+  })
+
+  it('rejects a hash-valid result whose output is not ContentBlock data', () => {
+    const forged = {
+      ...interaction(1),
+      outcome: {
+        kind: 'result',
+        result: { output: [42], stopReason: 'completed' },
+        redactions: 0,
+      },
+    } as unknown as CassetteInteractionBody
+    expect(() => parseCassette(signedCassette([forged])))
+      .toThrow(/result\.output\[0\] must be a typed content block/)
+  })
+
+  it('validates deeply nested tool-result content without recursive or quadratic path work', {
+    timeout: 20_000,
+  }, async () => {
+    const temp = await workspace()
+    const writer = await CassetteWriter.open(temp.path(), header(), 'create')
+    let output: JsonValue[] = [{ type: 'text', text: 'leaf' }]
+    for (let depth = 0; depth < 20_000; depth++) {
+      output = [{ type: 'tool-result', toolCallId: `call-${depth}`, content: output }]
+    }
+    const deep = {
+      ...interaction(1),
+      outcome: { kind: 'result', result: { output, stopReason: 'completed' }, redactions: 0 },
+    } as unknown as CassetteInteractionBody
+    await writer.append(deep)
+    await writer.close()
+    await expect(loadCassette(temp.path())).resolves.toMatchObject({ interactions: [{ sequence: 1 }] })
+  })
+
+  it.each(['metadata', 'full'] as const)(
+    'does not write an invalid %s request view',
+    async (requestStorage) => {
+      const temp = await workspace()
+      const writer = await CassetteWriter.open(temp.path(), header(requestStorage), 'create')
+      const invalid = {
+        ...interaction(1),
+        request: requestStorage === 'metadata'
+          ? {
+              storage: 'metadata',
+              metadata: {
+                promptBlocks: 1,
+                promptBytes: 10,
+                hasOutputSchema: false,
+                hasPersona: false,
+                privatePrompt: 'TOP_SECRET',
+              },
+            }
+          : {
+              storage: 'full',
+              value: { prompt: [], privatePrompt: 'TOP_SECRET' },
+              redactions: 0,
+            },
+      } as unknown as CassetteInteractionBody
+      await expect(writer.append(invalid)).rejects.toThrow(/privatePrompt is not supported/)
+      await expect(writer.close()).rejects.toThrow(/privatePrompt is not supported/)
+      await expect(loadCassette(temp.path())).resolves.toMatchObject({ interactions: [] })
+    },
+  )
 
   it('rejects duplicate and non-contiguous sequence and occurrence identities', () => {
     const fingerprint = `sha256:${'c'.repeat(64)}`

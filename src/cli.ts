@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { diffCassettes, type CassetteCallSummary, type CassetteDiff } from './diff.ts'
-import { loadCassette, summarizeCassette } from './format.ts'
+import { classifyStopReason, loadCassette, summarizeCassette } from './format.ts'
 
 const VERSION = '0.2.0'
 
@@ -13,6 +13,57 @@ export interface CliIo {
 const defaultIo: CliIo = {
   out: message => { process.stdout.write(`${message}\n`) },
   err: message => { process.stderr.write(`${message}\n`) },
+}
+
+const TERMINAL_CONTROL = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu
+const TERMINAL_CONTROL_CHARACTER = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
+
+function displayText(value: string): string {
+  return value.replace(TERMINAL_CONTROL, (character) => {
+    const codePoint = character.codePointAt(0)
+    return codePoint === undefined
+      ? ''
+      : `\\u{${codePoint.toString(16).padStart(4, '0')}}`
+  })
+}
+
+function jsonDocument(value: unknown): string {
+  const document = JSON.stringify(value, null, 2)
+  let output = ''
+  let insideString = false
+  let escaped = false
+  for (const character of document) {
+    if (!insideString) {
+      output += character
+      if (character === '"') insideString = true
+      continue
+    }
+    if (escaped) {
+      output += character
+      escaped = false
+      continue
+    }
+    if (character === '\\') {
+      output += character
+      escaped = true
+      continue
+    }
+    if (character === '"') {
+      output += character
+      insideString = false
+      continue
+    }
+    if (!TERMINAL_CONTROL_CHARACTER.test(character)) {
+      output += character
+      continue
+    }
+    let escapeSequence = ''
+    for (let index = 0; index < character.length; index++) {
+      escapeSequence += `\\u${character.charCodeAt(index).toString(16).padStart(4, '0')}`
+    }
+    output += escapeSequence
+  }
+  return output
 }
 
 function usage(): string {
@@ -31,9 +82,9 @@ function usage(): string {
 
 function formatSummary(summary: ReturnType<typeof summarizeCassette>): string {
   return [
-    `Cassette: ${summary.cassetteId}`,
-    `File: ${summary.file ?? '<memory>'}`,
-    `Provider: ${summary.provider.cassette} -> ${summary.provider.upstream}`,
+    `Cassette: ${displayText(summary.cassetteId)}`,
+    `File: ${displayText(summary.file ?? '<memory>')}`,
+    `Provider: ${displayText(summary.provider.cassette)} -> ${displayText(summary.provider.upstream)}`,
     `Interactions: ${summary.interactions}`,
     `Completed / failed / aborted: ${summary.completed} / ${summary.failed} / ${summary.aborted}`,
     `Ambiguous duplicate groups: ${summary.ambiguousGroups}`,
@@ -52,8 +103,8 @@ function formatDiff(diff: CassetteDiff, expected: string, actual: string, showCa
     item => item.startLatencyDeltaMs !== 0 || item.deltaMs !== 0,
   )
   const lines = [
-    `Expected: ${expected}`,
-    `Actual: ${actual}`,
+    `Expected: ${displayText(expected)}`,
+    `Actual: ${displayText(actual)}`,
     `Comparable / equivalent: ${diff.comparable ? 'yes' : 'no'} / ${diff.equivalent ? 'yes' : 'no'}`,
     `Interactions: ${diff.expectedInteractions} -> ${diff.actualInteractions}`,
     `Added / removed / outcome / boundary: ${diff.added.length} / ${diff.removed.length} / `
@@ -63,17 +114,19 @@ function formatDiff(diff: CassetteDiff, expected: string, actual: string, showCa
     `Timing changes (informational): ${changedTiming.length}`,
   ]
   if (!showCalls) return lines
-  for (const call of diff.added) lines.push(`+ ${call.callKey}  ${terminal(call)}`)
-  for (const call of diff.removed) lines.push(`- ${call.callKey}  ${terminal(call)}`)
+  for (const call of diff.added) lines.push(`+ ${displayText(call.callKey)}  ${terminal(call)}`)
+  for (const call of diff.removed) lines.push(`- ${displayText(call.callKey)}  ${terminal(call)}`)
   for (const change of diff.outcomeChanged) {
-    lines.push(`~ ${change.expected.callKey}  outcome ${terminal(change.expected)} -> ${terminal(change.actual)}`)
+    lines.push(
+      `~ ${displayText(change.expected.callKey)}  outcome ${terminal(change.expected)} -> ${terminal(change.actual)}`,
+    )
   }
   for (const change of diff.boundaryChanged) {
-    lines.push(`~ ${change.expected.callKey}  boundary ${change.fields.join(', ')}`)
+    lines.push(`~ ${displayText(change.expected.callKey)}  boundary ${change.fields.join(', ')}`)
   }
   for (const timing of changedTiming) {
     lines.push(
-      `= ${timing.expectedCallKey}  timing start ${timing.startLatencyDeltaMs >= 0 ? '+' : ''}`
+      `= ${displayText(timing.expectedCallKey)}  timing start ${timing.startLatencyDeltaMs >= 0 ? '+' : ''}`
       + `${timing.startLatencyDeltaMs.toFixed(1)}ms, duration ${timing.deltaMs >= 0 ? '+' : ''}`
       + `${timing.deltaMs.toFixed(1)}ms`,
     )
@@ -126,14 +179,14 @@ export async function runCli(args: readonly string[], io: CliIo = defaultIo): Pr
     return command === undefined ? 1 : 0
   }
   if (command !== 'verify' && command !== 'inspect' && command !== 'diff') {
-    io.err(`Unknown command: ${command}\n\n${usage()}`)
+    io.err(`Unknown command: ${displayText(command)}\n\n${usage()}`)
     return 1
   }
   let parsed: ParsedCommand
   try {
     parsed = parseCommandArgs(command, args.slice(1))
   } catch (error: unknown) {
-    io.err(`${error instanceof Error ? error.message : String(error)}\n\n${usage()}`)
+    io.err(`${displayText(error instanceof Error ? error.message : String(error))}\n\n${usage()}`)
     return 1
   }
   try {
@@ -146,7 +199,7 @@ export async function runCli(args: readonly string[], io: CliIo = defaultIo): Pr
         loadCassette(actualPath),
       ])
       const diff = diffCassettes(expected, actual)
-      if (parsed.json) io.out(JSON.stringify(diff, null, 2))
+      if (parsed.json) io.out(jsonDocument(diff))
       else for (const line of formatDiff(diff, expectedPath, actualPath, parsed.showCalls)) io.out(line)
       return diff.equivalent ? 0 : 2
     }
@@ -167,24 +220,24 @@ export async function runCli(args: readonly string[], io: CliIo = defaultIo): Pr
                 requestFingerprint: interaction.requestFingerprint,
                 outcome: interaction.outcome.kind,
                 stopReason: interaction.outcome.kind === 'result'
-                  ? interaction.outcome.result.stopReason
+                  ? classifyStopReason(interaction.outcome.result.stopReason)
                   : undefined,
                 durationMs: interaction.timing.durationMs,
               })),
           }
         : summary
-      io.out(JSON.stringify(document, null, 2))
+      io.out(jsonDocument(document))
     } else if (command === 'verify') {
-      io.out(`OK: ${summary.interactions} interaction(s), hash chain verified (${summary.cassetteId})`)
+      io.out(`OK: ${summary.interactions} interaction(s), hash chain verified (${displayText(summary.cassetteId)})`)
     } else {
       io.out(formatSummary(summary))
       if (parsed.showCalls) {
         for (const interaction of [...cassette.interactions].sort((a, b) => a.sequence - b.sequence)) {
           const stop = interaction.outcome.kind === 'result'
-            ? interaction.outcome.result.stopReason
+            ? classifyStopReason(interaction.outcome.result.stopReason)
             : interaction.outcome.kind
           io.out(
-            `${interaction.sequence.toString().padStart(4)}  ${interaction.callKey}  ${stop}  `
+            `${interaction.sequence.toString().padStart(4)}  ${displayText(interaction.callKey)}  ${stop}  `
             + `${interaction.timing.durationMs.toFixed(1)}ms`,
           )
         }
@@ -192,7 +245,7 @@ export async function runCli(args: readonly string[], io: CliIo = defaultIo): Pr
     }
     return 0
   } catch (error: unknown) {
-    io.err(error instanceof Error ? error.message : String(error))
+    io.err(displayText(error instanceof Error ? error.message : String(error)))
     return 1
   }
 }
