@@ -6,6 +6,13 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     labels: [dependencies]
+    ignore:
+      - dependency-name: "@deepseek-ai/dsh-*"
+      - dependency-name: "@deepseek-ai/cordis"
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: /
