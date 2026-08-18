@@ -1,0 +1,14 @@
+# Replay the fixed artifact produced by record.patch.yml.
+# No upstream provider is called by the cassette provider in this mode.
+- insert:
+    - id: subagent-cassette
+      name: "dsh-subagent-cassette"
+      config:
+        mode: replay
+        provider: cassette
+        file: ".dsh-cassettes/repository-audit.cassette.jsonl"
+        timing: instant
+        speed: 1
+        duplicatePolicy: reject
+        allowRedactedReplay: false
+        assertConsumed: true

@@ -1,0 +1,12 @@
+# Add the cassette provider without replacing the deployment's real provider.
+- insert:
+    - id: subagent-cassette
+      name: "dsh-subagent-cassette"
+      config:
+        mode: record
+        provider: cassette
+        upstreamProvider: spawn
+        file: ".dsh-cassettes/subagents-{timestamp}-{pid}.cassette.jsonl"
+        writeMode: create
+        requestStorage: metadata
+        redactSecrets: true

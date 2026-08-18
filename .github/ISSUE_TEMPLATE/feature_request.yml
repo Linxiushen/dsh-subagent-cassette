@@ -1,0 +1,56 @@
+name: Feature request
+description: Propose a scoped recording, replay, format, or operability improvement.
+title: "feat: "
+labels: [enhancement, triage]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the testing or operational problem, not only the proposed API.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Show the smallest API, configuration, or format change that solves it.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Recording lifecycle
+        - Replay matching
+        - Topology and concurrency
+        - Cassette format and CLI
+        - Redaction and security
+        - DSH compatibility
+        - Documentation and examples
+    validations:
+      required: true
+
+  - type: textarea
+    id: ambiguity
+    attributes:
+      label: Determinism and compatibility impact
+      description: Explain how the proposal handles duplicate requests, concurrent order, existing version-1 cassettes, and the exact DSH target.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope confirmation
+      options:
+        - label: I understand this project intentionally targets the one-shot SubagentProvider boundary, not general session replay.
+          required: true

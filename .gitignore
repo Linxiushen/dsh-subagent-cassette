@@ -1,0 +1,13 @@
+node_modules/
+dist/
+coverage/
+.dsh-cassettes/
+*.cassette.jsonl
+*.writer.lock/
+*.tgz
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db

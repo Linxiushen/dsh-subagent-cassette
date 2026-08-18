@@ -1,0 +1,14 @@
+# Register a recording provider beside the existing `spawn` provider.
+# Calls must select provider `cassette` to be captured.
+- insert:
+    - id: subagent-cassette
+      name: "dsh-subagent-cassette"
+      config:
+        mode: record
+        provider: cassette
+        upstreamProvider: spawn
+        file: ".dsh-cassettes/repository-audit.cassette.jsonl"
+        writeMode: create
+        requestStorage: metadata
+        redactSecrets: true
+        redactionPatterns: []
