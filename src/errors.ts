@@ -1,3 +1,5 @@
+import type { CassetteMismatchDiagnostic } from './types.ts'
+
 /** Base error for cassette configuration, format, and replay failures. */
 export class CassetteError extends Error {
   readonly code: string
@@ -17,11 +19,18 @@ export class CassetteFormatError extends CassetteError {
   }
 }
 
+export interface CassetteMismatchErrorOptions extends ErrorOptions {
+  readonly diagnostic?: CassetteMismatchDiagnostic
+}
+
 /** Raised when a live call cannot be matched without guessing. */
 export class CassetteMismatchError extends CassetteError {
-  constructor(message: string, options?: ErrorOptions) {
+  readonly diagnostic?: CassetteMismatchDiagnostic
+
+  constructor(message: string, options?: CassetteMismatchErrorOptions) {
     super(message, 'CASSETTE_MISMATCH', options)
     this.name = 'CassetteMismatchError'
+    if (options?.diagnostic !== undefined) this.diagnostic = options.diagnostic
   }
 }
 

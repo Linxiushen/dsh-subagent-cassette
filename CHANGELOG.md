@@ -6,6 +6,32 @@ All notable changes to this project are documented in this file. The project fol
 
 No changes yet.
 
+## [0.2.0] - 2026-08-18
+
+### Added
+
+- Structured replay mismatch diagnostics with five explicit failure reasons, deterministic candidates, and consumption state.
+- Non-consuming `InteractionMatcher.diagnose()` and `CassetteMismatchError.diagnostic` APIs.
+- Strict metadata-safe `diffCassettes()` API and `dsh-cassette diff` CLI for cassette regression checks.
+- CI-oriented diff exit codes: `0` for equivalent, `2` for different or non-comparable, and `1` for operational errors.
+- A public `dsh-subagent-cassette/diff` package export.
+
+### Changed
+
+- CLI parsing now rejects unknown options and unexpected positional arguments.
+- Diff treats timing as informational, ignores physical completion order, and fails closed for ambiguous duplicate groups or changed parent-context semantics.
+
+### Fixed
+
+- Installed pnpm bin shims now execute the CLI correctly by using the supported `import.meta.main` entry check.
+
+### Security
+
+- Mismatch and diff reports are limited to call metadata and unsalted fingerprints; prompt, result, and recorded error bodies are covered by regression tests.
+- Documented that the legacy `InteractionMatcher.describe()` debugging view includes prompt content.
+
+Cassette format version `1` and the exact DSH `0.1.0-rc.7` compatibility target are unchanged.
+
 ## [0.1.0] - 2026-08-18
 
 Initial source release targeting the DeepSeek Harness `0.1.0-rc.7` package family.
@@ -35,5 +61,6 @@ Initial source release targeting the DeepSeek Harness `0.1.0-rc.7` package famil
 - One logical top-level root per cassette scenario.
 - The unkeyed hash chain is not authentication and has no trusted tail commitment.
 
-[Unreleased]: https://github.com/Linxiushen/dsh-subagent-cassette/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Linxiushen/dsh-subagent-cassette/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Linxiushen/dsh-subagent-cassette/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Linxiushen/dsh-subagent-cassette/releases/tag/v0.1.0

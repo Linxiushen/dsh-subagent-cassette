@@ -16,6 +16,12 @@ export type CassetteWriteMode = 'create' | 'append' | 'truncate'
 export type RequestStorage = 'metadata' | 'full'
 export type ReplayTiming = 'instant' | 'recorded'
 export type DuplicatePolicy = 'reject' | 'sequence'
+export type CassetteMismatchReason =
+  | 'group-exhausted'
+  | 'parent-context-changed'
+  | 'request-changed'
+  | 'parent-and-request-changed'
+  | 'parent-not-found'
 
 export interface CassetteProviderFacts {
   readonly cassette: string
@@ -82,6 +88,35 @@ export interface RequestMetadata {
   readonly toolFilter?: JsonValue
   readonly hasPersona: boolean
 }
+
+export interface CassetteDiagnosticRequest {
+  readonly parentKey: string
+  readonly parentContextFingerprint: string
+  readonly requestFingerprint: string
+  readonly requestMetadata: RequestMetadata
+}
+
+export interface CassetteDiagnosticCandidate extends CassetteDiagnosticRequest {
+  readonly sequence: number
+  readonly callKey: string
+  readonly occurrence: number
+  readonly consumed: boolean
+}
+
+export interface CassetteMatchDiagnostic {
+  readonly status: 'match'
+  readonly actual: CassetteDiagnosticRequest
+  readonly candidate: CassetteDiagnosticCandidate
+}
+
+export interface CassetteMismatchDiagnostic {
+  readonly status: 'mismatch'
+  readonly reason: CassetteMismatchReason
+  readonly actual: CassetteDiagnosticRequest
+  readonly candidates: readonly CassetteDiagnosticCandidate[]
+}
+
+export type CassetteDiagnostic = CassetteMatchDiagnostic | CassetteMismatchDiagnostic
 
 export type StoredRequest =
   | { readonly storage: 'metadata'; readonly metadata: RequestMetadata }

@@ -4,6 +4,7 @@ export default defineConfig({
   entry: {
     index: 'src/index.ts',
     format: 'src/format.ts',
+    diff: 'src/diff.ts',
     cli: 'src/cli.ts',
   },
   clean: true,

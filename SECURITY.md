@@ -2,11 +2,12 @@
 
 ## Supported versions
 
-Until a stable release, fixes are made on the latest `0.1.x` source release only.
+Until a stable release, fixes are made on the latest `0.2.x` source release only.
 
 | Project line | DSH target | Security support |
 |---|---|---|
-| `0.1.x` | `0.1.0-rc.7` | Current |
+| `0.2.x` | `0.1.0-rc.7` | Current |
+| `0.1.x` | `0.1.0-rc.7` | Unsupported |
 | other versions | any | Unsupported |
 
 The exact DSH target is part of the cassette header and parser validation. Forcing a different peer-dependency version is outside the supported configuration.

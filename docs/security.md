@@ -101,6 +101,14 @@ Loading performs synchronous JSON parsing and canonical hashing over the whole f
 
 Recorded results should be treated as untrusted external data at the application boundary, just like live provider output. Replay intentionally returns them; it does not sanitize commands, URLs, markup, tool arguments, or prompt-injection content.
 
+## Diagnostic and diff output
+
+Structured mismatch diagnostics project only parent/call keys, request and parent-context fingerprints, occurrences, consumption state, and the request metadata already used by metadata-mode cassettes. They do not include live or stored prompt bodies, result bodies, or recorded error messages. Cassette diff reports use the same boundary and represent outcomes only by terminal metadata and unsalted SHA-256 fingerprints.
+
+This output is metadata-safe, not anonymous or cryptographically private. Labels, tool filters, provider/model names, topology paths, byte counts, filesystem paths printed by the human CLI, and low-entropy fingerprints can still disclose or confirm sensitive facts. Outcome fingerprints can likewise be checked against guessed low-entropy results or errors. Apply the same log access and retention controls used for cassette metadata.
+
+`InteractionMatcher.describe()` is a legacy low-level debugging API that returns a canonical representation containing the normalized live request, including prompt content. Do not log or publish its result. Prefer `diagnose()` and `CassetteMismatchError.diagnostic` for metadata-safe failure reporting.
+
 ## Operational recommendations
 
 - Keep `.dsh-cassettes/` out of source control by default; add only reviewed synthetic fixtures intentionally.
@@ -124,4 +132,4 @@ Do not attach real cassettes, credentials, private prompts, or model outputs. Or
 
 ## Supported versions
 
-Until the first stable release, security fixes are provided on the latest `0.1.x` source release only. The current implementation target remains DSH `0.1.0-rc.7`; using another DSH version is unsupported even if dependency resolution is forced.
+Until the first stable release, security fixes are provided on the latest `0.2.x` source release only. The current implementation target remains DSH `0.1.0-rc.7`; using another DSH version is unsupported even if dependency resolution is forced.

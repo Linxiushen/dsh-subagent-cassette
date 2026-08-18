@@ -7,12 +7,17 @@ import {
   fingerprintRequest,
   normalizeParentContext,
   normalizeRequest,
+  requestMetadata,
 } from './canonical.ts'
 import { CassetteAmbiguityError, CassetteMismatchError } from './errors.ts'
 import { ambiguousGroups } from './format.ts'
 import type {
+  CassetteDiagnostic,
+  CassetteDiagnosticCandidate,
+  CassetteDiagnosticRequest,
   CassetteFile,
   CassetteInteraction,
+  CassetteMismatchDiagnostic,
   DuplicatePolicy,
   JsonValue,
   NormalizedSubagentRequest,
@@ -57,6 +62,17 @@ export class TopologyTracker {
     const id = String(parent.id)
     const known = this.parentKeys.get(id)
     if (known !== undefined) return known
+    const parentKey = this.peekParentKey(parent)
+    this.rootId = id
+    this.parentKeys.set(id, parentKey)
+    return parentKey
+  }
+
+  /** Resolve a live parent without reserving it as this matcher's root. */
+  peekParentKey(parent: Agent): string {
+    const id = String(parent.id)
+    const known = this.parentKeys.get(id)
+    if (known !== undefined) return known
     if (parent.session.header.origin === 'subagent') {
       throw new CassetteAmbiguityError(
         `subagent parent "${id}" was not created through this cassette provider; `
@@ -64,8 +80,6 @@ export class TopologyTracker {
       )
     }
     if (this.rootId === undefined) {
-      this.rootId = id
-      this.parentKeys.set(id, 'root')
       return 'root'
     }
     if (this.rootId !== id) {
@@ -125,6 +139,7 @@ export class InteractionMatcher {
   private readonly topology: TopologyTracker
   private readonly groups = new Map<string, CassetteInteraction[]>()
   private readonly consumed = new Set<string>()
+  private readonly interactions: readonly CassetteInteraction[]
 
   constructor(
     private readonly cassette: CassetteFile,
@@ -132,6 +147,7 @@ export class InteractionMatcher {
     allowRedactedReplay: boolean,
   ) {
     this.topology = new TopologyTracker(cassette.header.provider.inheritsParentContext)
+    this.interactions = [...cassette.interactions].sort((a, b) => a.sequence - b.sequence)
     const ambiguous = ambiguousGroups(cassette)
     if (duplicatePolicy === 'reject' && ambiguous.length > 0) {
       throw new CassetteAmbiguityError(
@@ -150,7 +166,7 @@ export class InteractionMatcher {
         )
       }
     }
-    for (const interaction of [...cassette.interactions].sort((a, b) => a.occurrence - b.occurrence)) {
+    for (const interaction of this.interactions) {
       const key = interactionGroup(
         interaction.parentKey,
         interaction.parentContextFingerprint,
@@ -160,32 +176,46 @@ export class InteractionMatcher {
       group.push(interaction)
       this.groups.set(key, group)
     }
+    for (const group of this.groups.values()) {
+      group.sort((a, b) => a.occurrence - b.occurrence)
+    }
   }
 
   match(request: ResolvedSubagentStartRequest): CassetteInteraction {
     const normalized = normalizeRequest(request)
     const parentKey = this.topology.parentKey(request.parent)
-    const parentContextFingerprint = fingerprintParentContext(
-      normalizeParentContext(request.parent, this.cassette.header.provider.inheritsParentContext),
+    const actual = this.describeActual(request, parentKey, normalized)
+    const key = interactionGroup(
+      actual.parentKey,
+      actual.parentContextFingerprint,
+      actual.requestFingerprint,
     )
-    const requestFingerprint = fingerprintRequest(normalized)
-    const key = interactionGroup(parentKey, parentContextFingerprint, requestFingerprint)
     const interaction = this.groups.get(key)?.shift()
     if (interaction === undefined) {
-      const label = normalized.label === undefined ? '<unlabelled>' : JSON.stringify(normalized.label)
-      const available = [...this.groups.entries()]
-        .filter(([, values]) => values.length > 0)
-        .slice(0, 3)
-        .map(([candidate]) => candidate.split('\0')[2]?.slice(0, 19))
-        .filter((candidate): candidate is string => candidate !== undefined)
-      throw new CassetteMismatchError(
-        `no cassette interaction matches parent "${parentKey}", label ${label}, `
-        + `parent context ${parentContextFingerprint}, request ${requestFingerprint}; `
-        + `remaining request fingerprints: ${available.join(', ') || 'none'}`,
-      )
+      const diagnostic = this.mismatchDiagnostic(actual)
+      throw new CassetteMismatchError(this.mismatchMessage(diagnostic), { diagnostic })
     }
     this.consumed.add(interaction.callKey)
     return interaction
+  }
+
+  /** Explain whether a request can match without consuming an interaction. */
+  diagnose(request: ResolvedSubagentStartRequest): CassetteDiagnostic {
+    const normalized = normalizeRequest(request)
+    const parentKey = this.topology.peekParentKey(request.parent)
+    const actual = this.describeActual(request, parentKey, normalized)
+    const key = interactionGroup(
+      actual.parentKey,
+      actual.parentContextFingerprint,
+      actual.requestFingerprint,
+    )
+    const interaction = this.groups.get(key)?.[0]
+    if (interaction === undefined) return this.mismatchDiagnostic(actual)
+    return {
+      status: 'match',
+      actual,
+      candidate: this.diagnosticCandidate(interaction),
+    }
   }
 
   assertConsumed(): void {
@@ -197,7 +227,7 @@ export class InteractionMatcher {
     )
   }
 
-  /** Diagnostic fingerprint for a request without consuming it. */
+  /** Canonical request debugging view, including prompt content. Prefer diagnose() for safe metadata. */
   describe(request: ResolvedSubagentStartRequest): string {
     const normalized = normalizeRequest(request)
     const parentContextFingerprint = fingerprintParentContext(
@@ -207,5 +237,106 @@ export class InteractionMatcher {
       parentContextFingerprint,
       request: normalized as unknown as JsonValue,
     })
+  }
+
+  private describeActual(
+    request: ResolvedSubagentStartRequest,
+    parentKey: string,
+    normalized: NormalizedSubagentRequest,
+  ): CassetteDiagnosticRequest {
+    return {
+      parentKey,
+      parentContextFingerprint: fingerprintParentContext(
+        normalizeParentContext(request.parent, this.cassette.header.provider.inheritsParentContext),
+      ),
+      requestFingerprint: fingerprintRequest(normalized),
+      requestMetadata: requestMetadata(normalized),
+    }
+  }
+
+  private diagnosticCandidate(interaction: CassetteInteraction): CassetteDiagnosticCandidate {
+    const metadata = interaction.request.storage === 'metadata'
+      ? interaction.request.metadata
+      : requestMetadata(interaction.request.value)
+    return {
+      sequence: interaction.sequence,
+      callKey: interaction.callKey,
+      parentKey: interaction.parentKey,
+      parentContextFingerprint: interaction.parentContextFingerprint,
+      occurrence: interaction.occurrence,
+      requestFingerprint: interaction.requestFingerprint,
+      requestMetadata: metadata,
+      consumed: this.consumed.has(interaction.callKey),
+    }
+  }
+
+  private mismatchDiagnostic(actual: CassetteDiagnosticRequest): CassetteMismatchDiagnostic {
+    const sameParent = this.interactions.filter(item => item.parentKey === actual.parentKey)
+    const exact = sameParent.filter(item => (
+      item.parentContextFingerprint === actual.parentContextFingerprint
+      && item.requestFingerprint === actual.requestFingerprint
+    ))
+    if (exact.length > 0) {
+      return {
+        status: 'mismatch',
+        reason: 'group-exhausted',
+        actual,
+        candidates: exact.map(item => this.diagnosticCandidate(item)),
+      }
+    }
+    if (sameParent.length === 0) {
+      return {
+        status: 'mismatch',
+        reason: 'parent-not-found',
+        actual,
+        candidates: this.interactions.map(item => this.diagnosticCandidate(item)),
+      }
+    }
+    const sameRequest = sameParent.filter(
+      item => item.requestFingerprint === actual.requestFingerprint,
+    )
+    if (sameRequest.length > 0) {
+      return {
+        status: 'mismatch',
+        reason: 'parent-context-changed',
+        actual,
+        candidates: sameRequest.map(item => this.diagnosticCandidate(item)),
+      }
+    }
+    const sameContext = sameParent.filter(
+      item => item.parentContextFingerprint === actual.parentContextFingerprint,
+    )
+    if (sameContext.length > 0) {
+      return {
+        status: 'mismatch',
+        reason: 'request-changed',
+        actual,
+        candidates: sameContext.map(item => this.diagnosticCandidate(item)),
+      }
+    }
+    return {
+      status: 'mismatch',
+      reason: 'parent-and-request-changed',
+      actual,
+      candidates: sameParent.map(item => this.diagnosticCandidate(item)),
+    }
+  }
+
+  private mismatchMessage(diagnostic: CassetteMismatchDiagnostic): string {
+    const label = diagnostic.actual.requestMetadata.label === undefined
+      ? '<unlabelled>'
+      : JSON.stringify(diagnostic.actual.requestMetadata.label)
+    const sample = diagnostic.candidates.slice(0, 3).map(candidate => (
+      `${candidate.callKey} (${candidate.consumed ? 'consumed' : 'available'})`
+    )).join(', ')
+    if (diagnostic.reason === 'group-exhausted') {
+      return `cassette interaction group for parent "${diagnostic.actual.parentKey}", label ${label} `
+        + `has exhausted all ${diagnostic.candidates.length} recorded occurrence(s); `
+        + `recorded calls: ${sample || 'none'}`
+    }
+    return `no cassette interaction matches parent "${diagnostic.actual.parentKey}", label ${label}, `
+      + `parent context ${diagnostic.actual.parentContextFingerprint}, `
+      + `request ${diagnostic.actual.requestFingerprint}; diagnosis: ${diagnostic.reason}; `
+      + `candidate calls: ${sample || 'none'}`
   }
 }

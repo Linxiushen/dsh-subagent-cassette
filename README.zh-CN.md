@@ -41,7 +41,8 @@
 - 默认拒绝回放被脱敏改写过的成功结果，因为 `[REDACTED]` 已不再是原始数据。
 - 使用带版本号的 JSONL 和 SHA-256 前向 hash 链。
 - create、truncate、append 全程持有跨进程独占 writer lock。
-- 提供只输出元数据的 `verify`、`inspect` CLI。
+- 提供只输出元数据的 `verify`、`inspect` 和严格 cassette `diff` CLI。
+- 对精确回放不匹配返回结构化、metadata-safe 的诊断。
 - 默认在 replay 卸载时检查 cassette 是否全部消费。
 
 ## 非目标与当前限制
@@ -77,7 +78,7 @@ pnpm pack --pack-destination .artifacts
 然后把生成的 tarball 安装到实际使用的 DSH profile，例如：
 
 ```bash
-dsh plugin --profile web add ./.artifacts/dsh-subagent-cassette-0.1.0.tgz
+dsh plugin --profile web add ./.artifacts/dsh-subagent-cassette-0.2.0.tgz
 dsh --profile web --dump-config
 ```
 
@@ -108,13 +109,14 @@ dsh --profile web --dump-config
 
 相对路径按进程工作目录解析。临时批量录制可以使用内置默认路径中的 `{timestamp}`、`{pid}` token；需要复用的测试 fixture 应使用明确文件名。
 
-### 2. 校验与查看
+### 2. 校验、查看与比较
 
 在源码目录执行过 `pnpm build` 后：
 
 ```bash
 node dist/cli.js verify .dsh-cassettes/repository-audit.cassette.jsonl
 node dist/cli.js inspect .dsh-cassettes/repository-audit.cassette.jsonl --show-calls
+node dist/cli.js diff baseline.cassette.jsonl candidate.cassette.jsonl --show-calls
 ```
 
 在已安装该包的部署中：
@@ -122,9 +124,12 @@ node dist/cli.js inspect .dsh-cassettes/repository-audit.cassette.jsonl --show-c
 ```bash
 pnpm exec dsh-cassette verify .dsh-cassettes/repository-audit.cassette.jsonl
 pnpm exec dsh-cassette inspect .dsh-cassettes/repository-audit.cassette.jsonl --json --show-calls
+pnpm exec dsh-cassette diff baseline.cassette.jsonl candidate.cassette.jsonl --json
 ```
 
 `inspect` 只输出元数据、call key、指纹、outcome 类型、stop reason 和耗时，不输出已保存的 prompt 或结果正文。但 label 会出现在元数据和可读 call key 中，因此 CLI 输出不一定匿名。
+
+`diff` 只按完整稳定身份 `(parent key, parent-context fingerprint, request fingerprint, occurrence)` 对齐，分别报告新增、删除、结果变化、边界变化和录制策略漂移。Timing delta 只作信息展示，不影响等价判定。退出码 `0` 表示等价，`2` 表示存在差异或无法安全比较，`1` 表示参数、读取或格式错误。遇到歧义重复组或父上下文继承语义变化时会 fail closed，不进行猜测式对齐。
 
 ### 3. 离线回放
 
@@ -201,6 +206,18 @@ replay 会在注册 provider 前读取并校验当前完整文件，同时按策
 录制错误保留 name、message 和可选字符串 code，但不会恢复原 Error class、stack、cause 或其他自定义字段。
 
 `timing: recorded` 会按 `speed` 缩放 start latency 和剩余 duration。它只复现边界延时，不复现内部调度或 token stream。
+
+## 不匹配诊断
+
+`InteractionMatcher.diagnose(request)` 使用与 replay 相同的精确分析，但不会消费 interaction，也不会预留新的 root parent。结果要么是可匹配候选，要么是以下五种 mismatch reason 之一：
+
+- `group-exhausted`
+- `parent-context-changed`
+- `request-changed`
+- `parent-and-request-changed`
+- `parent-not-found`
+
+`match()` 失败时，同一个结构化对象会出现在 `CassetteMismatchError.diagnostic`。候选按录制时的 admission sequence 确定性排序，并标记是否已消费。诊断只包含 call key、指纹、occurrence 和请求元数据，不包含已保存的 prompt、result 或 error 正文；候选仅用于解释失败，绝不参与模糊匹配。
 
 ## 完整性边界
 

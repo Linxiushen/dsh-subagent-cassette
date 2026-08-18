@@ -41,7 +41,8 @@ This is strict boundary replay, not a general session simulator or a claim that 
 - Refuses replay of a redacted result by default, because `[REDACTED]` is substituted data.
 - Uses a versioned JSONL format with a forward SHA-256 record chain.
 - Holds an exclusive cross-process writer lock for create, truncate, and append modes.
-- Provides metadata-only `verify` and `inspect` CLI commands.
+- Provides metadata-only `verify`, `inspect`, and strict cassette `diff` CLI commands.
+- Returns structured, metadata-safe diagnostics for exact replay mismatches.
 - Checks for unmatched cassette interactions at replay teardown by default.
 
 ## Non-goals and current limits
@@ -77,7 +78,7 @@ pnpm pack --pack-destination .artifacts
 Install the resulting tarball into the DSH profile you use, for example:
 
 ```bash
-dsh plugin --profile web add ./.artifacts/dsh-subagent-cassette-0.1.0.tgz
+dsh plugin --profile web add ./.artifacts/dsh-subagent-cassette-0.2.0.tgz
 dsh --profile web --dump-config
 ```
 
@@ -108,13 +109,14 @@ Route the one-shot subagent calls being captured to provider `cassette`. Calls t
 
 The file path is resolved from the process working directory. For repeated ad hoc captures, the bundled default uses `{timestamp}` and `{pid}` tokens. For a reusable fixture, choose an explicit filename as above.
 
-### 2. Verify and inspect
+### 2. Verify, inspect, and diff
 
 From this source checkout after `pnpm build`:
 
 ```bash
 node dist/cli.js verify .dsh-cassettes/repository-audit.cassette.jsonl
 node dist/cli.js inspect .dsh-cassettes/repository-audit.cassette.jsonl --show-calls
+node dist/cli.js diff baseline.cassette.jsonl candidate.cassette.jsonl --show-calls
 ```
 
 From a deployment that installed the package:
@@ -122,9 +124,12 @@ From a deployment that installed the package:
 ```bash
 pnpm exec dsh-cassette verify .dsh-cassettes/repository-audit.cassette.jsonl
 pnpm exec dsh-cassette inspect .dsh-cassettes/repository-audit.cassette.jsonl --json --show-calls
+pnpm exec dsh-cassette diff baseline.cassette.jsonl candidate.cassette.jsonl --json
 ```
 
 `inspect` prints metadata, call keys, fingerprints, outcome kinds, stop reasons, and durations. It never prints stored prompts or result bodies. Labels can appear inside metadata and readable call keys, so CLI output is not necessarily anonymous.
+
+`diff` aligns only the exact stable identity `(parent key, parent-context fingerprint, request fingerprint, occurrence)`. It reports added, removed, outcome-changed, and boundary-changed calls plus recording-policy drift. Timing deltas are informational and do not affect equivalence. Exit code `0` means equivalent, `2` means different or not safely comparable, and `1` means usage, read, or format failure. Ambiguous duplicate groups and changed parent-context inheritance semantics fail closed instead of being guessed into alignment.
 
 ### 3. Replay offline
 
@@ -201,6 +206,18 @@ See [Format](docs/format.md) for the schema and [Security](docs/security.md) for
 Recorded failures preserve the recorded name, message, and optional string code, but not the original error class, stack, cause, or arbitrary properties.
 
 `timing: recorded` waits for recorded start latency and remaining duration divided by `speed`. It reproduces boundary delay, not internal scheduling or token streaming.
+
+## Mismatch diagnostics
+
+`InteractionMatcher.diagnose(request)` performs the same exact analysis as replay without consuming an interaction or reserving a new root parent. It returns either a matching candidate or one of five mismatch reasons:
+
+- `group-exhausted`
+- `parent-context-changed`
+- `request-changed`
+- `parent-and-request-changed`
+- `parent-not-found`
+
+When `match()` fails, the same object is available as `CassetteMismatchError.diagnostic`. Candidates are deterministically ordered by recorded admission sequence and identify whether each call is already consumed. The diagnostic contains call keys, fingerprints, occurrence data, and request metadata only; it never includes stored prompt, result, or error bodies. These candidates explain a failure and are never used for fuzzy matching.
 
 ## Integrity model
 

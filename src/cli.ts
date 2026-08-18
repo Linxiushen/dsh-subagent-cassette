@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
-import { pathToFileURL } from 'node:url'
+import { diffCassettes, type CassetteCallSummary, type CassetteDiff } from './diff.ts'
 import { loadCassette, summarizeCassette } from './format.ts'
 
-const VERSION = '0.1.0'
+const VERSION = '0.2.0'
 
 export interface CliIo {
   out(message: string): void
@@ -20,10 +20,12 @@ function usage(): string {
     'Usage:',
     '  dsh-cassette verify <file> [--json]',
     '  dsh-cassette inspect <file> [--json] [--show-calls]',
+    '  dsh-cassette diff <expected> <actual> [--json] [--show-calls]',
     '  dsh-cassette --version',
     '',
     'verify checks the schema, exact DSH target, and the complete SHA-256 hash chain.',
     'inspect prints only metadata; it never prints recorded prompts or results.',
+    'diff compares stable call identities and outcomes; exit code 2 means they differ.',
   ].join('\n')
 }
 
@@ -39,33 +41,121 @@ function formatSummary(summary: ReturnType<typeof summarizeCassette>): string {
   ].join('\n')
 }
 
+function terminal(summary: CassetteCallSummary): string {
+  return summary.outcomeKind === 'result'
+    ? (summary.stopReason ?? summary.outcomeKind)
+    : summary.outcomeKind
+}
+
+function formatDiff(diff: CassetteDiff, expected: string, actual: string, showCalls: boolean): string[] {
+  const changedTiming = diff.timing.filter(
+    item => item.startLatencyDeltaMs !== 0 || item.deltaMs !== 0,
+  )
+  const lines = [
+    `Expected: ${expected}`,
+    `Actual: ${actual}`,
+    `Comparable / equivalent: ${diff.comparable ? 'yes' : 'no'} / ${diff.equivalent ? 'yes' : 'no'}`,
+    `Interactions: ${diff.expectedInteractions} -> ${diff.actualInteractions}`,
+    `Added / removed / outcome / boundary: ${diff.added.length} / ${diff.removed.length} / `
+      + `${diff.outcomeChanged.length} / ${diff.boundaryChanged.length}`,
+    `Policy changes: ${diff.policyChanges.join(', ') || 'none'}`,
+    `Comparison issues: ${diff.issues.join(', ') || 'none'}`,
+    `Timing changes (informational): ${changedTiming.length}`,
+  ]
+  if (!showCalls) return lines
+  for (const call of diff.added) lines.push(`+ ${call.callKey}  ${terminal(call)}`)
+  for (const call of diff.removed) lines.push(`- ${call.callKey}  ${terminal(call)}`)
+  for (const change of diff.outcomeChanged) {
+    lines.push(`~ ${change.expected.callKey}  outcome ${terminal(change.expected)} -> ${terminal(change.actual)}`)
+  }
+  for (const change of diff.boundaryChanged) {
+    lines.push(`~ ${change.expected.callKey}  boundary ${change.fields.join(', ')}`)
+  }
+  for (const timing of changedTiming) {
+    lines.push(
+      `= ${timing.expectedCallKey}  timing start ${timing.startLatencyDeltaMs >= 0 ? '+' : ''}`
+      + `${timing.startLatencyDeltaMs.toFixed(1)}ms, duration ${timing.deltaMs >= 0 ? '+' : ''}`
+      + `${timing.deltaMs.toFixed(1)}ms`,
+    )
+  }
+  return lines
+}
+
+interface ParsedCommand {
+  readonly positionals: string[]
+  readonly json: boolean
+  readonly showCalls: boolean
+}
+
+function parseCommandArgs(
+  command: 'verify' | 'inspect' | 'diff',
+  args: readonly string[],
+): ParsedCommand {
+  const positionals: string[] = []
+  let json = false
+  let showCalls = false
+  for (const arg of args) {
+    if (arg === '--json') {
+      json = true
+      continue
+    }
+    if (arg === '--show-calls') {
+      showCalls = true
+      continue
+    }
+    if (arg.startsWith('-')) throw new Error(`Unknown option for ${command}: ${arg}`)
+    positionals.push(arg)
+  }
+  const expected = command === 'diff' ? 2 : 1
+  if (positionals.length !== expected) {
+    const noun = command === 'diff' ? 'cassette files' : 'cassette file'
+    throw new Error(`Expected ${expected} ${noun} for ${command}, received ${positionals.length}`)
+  }
+  return { positionals, json, showCalls }
+}
+
 /** Execute the dependency-free cassette CLI. */
 export async function runCli(args: readonly string[], io: CliIo = defaultIo): Promise<number> {
-  if (args.includes('--version')) {
+  if (args.length === 1 && args[0] === '--version') {
     io.out(VERSION)
     return 0
   }
   const command = args[0]
-  if (command === undefined || command === '--help' || command === '-h') {
+  if (command === undefined || command === '--help' || command === '-h' || args.includes('--help')) {
     io.out(usage())
     return command === undefined ? 1 : 0
   }
-  if (command !== 'verify' && command !== 'inspect') {
+  if (command !== 'verify' && command !== 'inspect' && command !== 'diff') {
     io.err(`Unknown command: ${command}\n\n${usage()}`)
     return 1
   }
-  const file = args[1]
-  if (file === undefined || file.startsWith('-')) {
-    io.err(`Missing cassette file.\n\n${usage()}`)
+  let parsed: ParsedCommand
+  try {
+    parsed = parseCommandArgs(command, args.slice(1))
+  } catch (error: unknown) {
+    io.err(`${error instanceof Error ? error.message : String(error)}\n\n${usage()}`)
     return 1
   }
-  const json = args.includes('--json')
-  const showCalls = args.includes('--show-calls')
   try {
+    if (command === 'diff') {
+      const expectedPath = parsed.positionals[0]
+      const actualPath = parsed.positionals[1]
+      if (expectedPath === undefined || actualPath === undefined) throw new Error('diff paths are unavailable')
+      const [expected, actual] = await Promise.all([
+        loadCassette(expectedPath),
+        loadCassette(actualPath),
+      ])
+      const diff = diffCassettes(expected, actual)
+      if (parsed.json) io.out(JSON.stringify(diff, null, 2))
+      else for (const line of formatDiff(diff, expectedPath, actualPath, parsed.showCalls)) io.out(line)
+      return diff.equivalent ? 0 : 2
+    }
+    const file = parsed.positionals[0]
+    if (file === undefined) throw new Error('cassette path is unavailable')
     const cassette = await loadCassette(file)
     const summary = summarizeCassette(cassette)
-    if (json) {
-      const document = command === 'inspect' && showCalls
+    if (parsed.json) {
+      const document = command === 'inspect' && parsed.showCalls
         ? {
             ...summary,
             calls: [...cassette.interactions]
@@ -88,7 +178,7 @@ export async function runCli(args: readonly string[], io: CliIo = defaultIo): Pr
       io.out(`OK: ${summary.interactions} interaction(s), hash chain verified (${summary.cassetteId})`)
     } else {
       io.out(formatSummary(summary))
-      if (showCalls) {
+      if (parsed.showCalls) {
         for (const interaction of [...cassette.interactions].sort((a, b) => a.sequence - b.sequence)) {
           const stop = interaction.outcome.kind === 'result'
             ? interaction.outcome.result.stopReason
@@ -107,7 +197,6 @@ export async function runCli(args: readonly string[], io: CliIo = defaultIo): Pr
   }
 }
 
-const entry = process.argv[1]
-if (entry !== undefined && import.meta.url === pathToFileURL(entry).href) {
+if (import.meta.main) {
   process.exitCode = await runCli(process.argv.slice(2))
 }

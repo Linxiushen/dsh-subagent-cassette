@@ -18,6 +18,17 @@ pnpm exec dsh-cassette verify .dsh-cassettes/repository-audit.cassette.jsonl
 pnpm exec dsh-cassette inspect .dsh-cassettes/repository-audit.cassette.jsonl --show-calls
 ```
 
+To gate a refreshed fixture in CI, compare it with the reviewed baseline:
+
+```bash
+pnpm exec dsh-cassette diff \
+  .dsh-cassettes/repository-audit.baseline.jsonl \
+  .dsh-cassettes/repository-audit.candidate.jsonl \
+  --json
+```
+
+Exit code `2` means a material difference or a comparison that failed closed. Timing deltas are reported but do not affect that code.
+
 Replace the record patch with the replay patch and run the same request-producing scenario. Replay parent context and request fields must match exactly. The default consumption assertion fails teardown if the scenario makes fewer matching calls than the file contains.
 
 ## Programmatic installation

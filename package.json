@@ -1,6 +1,6 @@
 {
   "name": "dsh-subagent-cassette",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Deterministic VCR-style recording and replay for concurrent DeepSeek Harness subagent calls.",
   "type": "module",
   "license": "MIT",
@@ -41,6 +41,10 @@
     "./format": {
       "types": "./dist/format.d.ts",
       "default": "./dist/format.js"
+    },
+    "./diff": {
+      "types": "./dist/diff.d.ts",
+      "default": "./dist/diff.js"
     },
     "./package.json": "./package.json",
     "./cordis.patch.yml": "./cordis.patch.yml"

@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the implemented `0.1.0` architecture. The compatibility target is the one-shot provider contract in `@deepseek-ai/dsh-subagent@0.1.0-rc.7`.
+This document describes the implemented `0.2.0` architecture. The compatibility target is the one-shot provider contract in `@deepseek-ai/dsh-subagent@0.1.0-rc.7`.
 
 ## Boundary and ownership
 
@@ -168,6 +168,28 @@ Every matched interaction is marked consumed. `CassetteHandle.assertConsumed()` 
 
 Set `assertConsumed: false` only when partial replay is intentional. Extra live calls always fail at match time regardless of this option.
 
+## Structured mismatch diagnostics
+
+The matcher retains an immutable, admission-sequence-ordered interaction index beside its consumable exact-match queues. `diagnose(request)` computes the same parent key, parent-context fingerprint, and request fingerprint as `match()`, but only peeks at the topology and queue. It neither consumes an interaction nor reserves a previously unseen top-level parent.
+
+The result is a discriminated union with `status: match` or `status: mismatch`. Mismatches classify exact-group exhaustion, parent-context drift, request drift, combined drift, and an unavailable parent topology. `match()` uses the same analysis to populate `CassetteMismatchError.diagnostic`, so human errors and programmatic diagnostics cannot diverge from matching rules.
+
+Candidate selection remains explanatory. It never changes the strict replay key and never supplies a fallback interaction. Candidates are ordered by recorded admission `sequence`, include their consumption state, and expose only request metadata, topology keys, fingerprints, and occurrence information. Stored prompts, results, and recorded error bodies are not projected into diagnostics.
+
+## Cassette diff
+
+`diffCassettes(expected, actual)` compares two already verified cassette documents using this exact identity:
+
+```text
+parentKey + NUL + parentContextFingerprint + NUL + requestFingerprint + NUL + occurrence
+```
+
+Physical line order, `sequence`, cassette id, creation time, record hashes, timestamps, and timing do not participate in alignment. For matched identities, canonical outcome fingerprints and the `published`/`local` boundary facts are compared. Timing deltas are returned as observational data but do not affect equivalence.
+
+The comparison also reports provider and persistence-policy drift. Differing `inheritsParentContext` values make the documents not safely comparable because their parent fingerprints have different semantics. Ambiguous duplicate outcome groups also fail closed instead of treating occurrence order as an inferred identity.
+
+The CLI maps an equivalent comparison to exit code `0`, a material difference or non-comparable input to `2`, and usage/read/format errors to `1`. Human and JSON reports contain metadata and fingerprints only, never stored request or outcome bodies.
+
 ## Component map
 
 | Module | Responsibility |
@@ -178,7 +200,8 @@ Set `assertConsumed: false` only when partial replay is intentional. Extra live 
 | `src/canonical.ts` | Lossless parent/request/result snapshots, volatile-id normalization, canonical JSON, metadata, and SHA-256 fingerprints. |
 | `src/redact.ts` | Built-in and configurable persistence redaction. |
 | `src/format.ts` | Versioned JSONL parsing, validation, hash chain, append writer, summaries. |
-| `src/cli.ts` | Metadata-only `verify` and `inspect` commands. |
+| `src/diff.ts` | Strict metadata-safe cassette comparison and timing deltas. |
+| `src/cli.ts` | Metadata-only `verify`, `inspect`, and `diff` commands. |
 | `src/errors.ts` | Stable cassette error classes and codes. |
 
 ## Deliberate extension points

@@ -29,6 +29,18 @@ export {
   CassetteMismatchError,
   CassetteRecordedError,
 } from './errors.ts'
+export type { CassetteMismatchErrorOptions } from './errors.ts'
+export { diffCassettes } from './diff.ts'
+export type {
+  CassetteBoundaryChangedCall,
+  CassetteCallIdentity,
+  CassetteCallSummary,
+  CassetteChangedCall,
+  CassetteComparisonIssue,
+  CassetteDiff,
+  CassettePolicyField,
+  CassetteTimingDelta,
+} from './diff.ts'
 export {
   ambiguousGroups,
   CassetteWriter,
@@ -52,7 +64,13 @@ export type {
   CassetteFile,
   CassetteHeader,
   CassetteInteraction,
+  CassetteDiagnostic,
+  CassetteDiagnosticCandidate,
+  CassetteDiagnosticRequest,
+  CassetteMatchDiagnostic,
   CassetteMode,
+  CassetteMismatchDiagnostic,
+  CassetteMismatchReason,
   CassetteSummary,
   CassetteWriteMode,
   DuplicatePolicy,

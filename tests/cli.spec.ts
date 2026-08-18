@@ -10,7 +10,7 @@ afterEach(async () => {
   await Promise.all(workspaces.splice(0).map(workspace => workspace.cleanup()))
 })
 
-async function fixture(): Promise<string> {
+async function fixture(firstOutput = 'private output'): Promise<string> {
   const temp = await tempWorkspace()
   workspaces.push(temp)
   const writer = await CassetteWriter.open(temp.path(), createHeader({
@@ -25,7 +25,7 @@ async function fixture(): Promise<string> {
     request: { storage: 'metadata', metadata: { promptBlocks: 1, promptBytes: 20, hasOutputSchema: false, hasPersona: false } },
     timing: { startedAt: new Date().toISOString(), startLatencyMs: 1, durationMs: 12 },
     published: true, local: false,
-    outcome: { kind: 'result', result: textResult('private output'), redactions: 0 },
+    outcome: { kind: 'result', result: textResult(firstOutput), redactions: 0 },
   })
   await writer.append({
     kind: 'cassette/interaction', sequence: 2, callKey: 'root/failure~1', parentKey: 'root', occurrence: 1,
@@ -90,10 +90,31 @@ describe('cassette CLI', () => {
     expect(captured.err.join('\n')).toMatch(/cannot read cassette/)
   })
 
+  it('returns CI-friendly diff codes without exposing recorded bodies', async () => {
+    const expected = await fixture()
+    const equivalent = capture()
+    expect(await runCli(['diff', expected, expected], equivalent.io)).toBe(0)
+    expect(equivalent.out.join('\n')).toContain('Comparable / equivalent: yes / yes')
+
+    const actual = await fixture('changed-private-output')
+    const changed = capture()
+    expect(await runCli(['diff', expected, actual, '--json'], changed.io)).toBe(2)
+    const output = changed.out.join('\n')
+    const report = JSON.parse(output) as Record<string, unknown>
+    expect(report).toMatchObject({ comparable: true, equivalent: false })
+    expect(output).not.toContain('private output')
+    expect(output).not.toContain('changed-private-output')
+
+    const human = capture()
+    expect(await runCli(['diff', expected, actual, '--show-calls'], human.io)).toBe(2)
+    expect(human.out.join('\n')).toContain('outcome completed -> completed')
+    expect(human.out.join('\n')).not.toContain('changed-private-output')
+  })
+
   it('supports version and help without filesystem access', async () => {
     const version = capture()
     expect(await runCli(['--version'], version.io)).toBe(0)
-    expect(version.out).toEqual(['0.1.0'])
+    expect(version.out).toEqual(['0.2.0'])
     const help = capture()
     expect(await runCli(['--help'], help.io)).toBe(0)
     expect(help.out.join('\n')).toContain('Usage:')
@@ -113,6 +134,14 @@ describe('cassette CLI', () => {
 
     const missing = capture()
     expect(await runCli(['inspect', '--json'], missing.io)).toBe(1)
-    expect(missing.err.join('\n')).toContain('Missing cassette file')
+    expect(missing.err.join('\n')).toContain('Expected 1 cassette file')
+
+    const unknownOption = capture()
+    expect(await runCli(['verify', 'fixture.jsonl', '--wat'], unknownOption.io)).toBe(1)
+    expect(unknownOption.err.join('\n')).toContain('Unknown option for verify: --wat')
+
+    const extra = capture()
+    expect(await runCli(['diff', 'one.jsonl', 'two.jsonl', 'three.jsonl'], extra.io)).toBe(1)
+    expect(extra.err.join('\n')).toContain('Expected 2 cassette files')
   })
 })
