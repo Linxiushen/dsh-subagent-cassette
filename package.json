@@ -99,6 +99,6 @@
     "publint": "^0.3.18",
     "tsdown": "^0.22.14",
     "typescript": "6.0.3",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.11"
   }
 }
